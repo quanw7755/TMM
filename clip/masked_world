@@ -1,0 +1,216 @@
+"""
+  @Author: 王权
+  @FileName: masked_world.py
+  @DateTime: 2026/9/7 16:14
+  @SoftWare: PyCharm
+"""
+import math
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+# ============================================================
+# 1. Deterministic 2x2 grouped masks
+# ============================================================
+
+def build_group_mask(
+    num_patches,
+    group_idx,
+    batch_size,
+    device,
+    num_groups=4
+):
+    """
+    Build deterministic spatial mask groups.
+
+    Default 4 groups:
+
+        0 1 0 1 ...
+        2 3 2 3 ...
+        0 1 0 1 ...
+        2 3 2 3 ...
+
+    Every patch belongs to exactly one group.
+
+    Parameters
+    ----------
+    num_patches:
+        N = H * W
+
+    group_idx:
+        0, 1, 2, 3
+
+    return
+    ------
+    mask:
+        [B, N], bool
+        True means this patch is hidden from the context encoder.
+    """
+
+    if num_groups != 4:
+        raise ValueError(
+            "Current implementation uses exactly 4 "
+            "interleaved spatial mask groups."
+        )
+
+    h = int(
+        math.sqrt(num_patches)
+    )
+
+    if h * h != num_patches:
+        raise ValueError(
+            f"num_patches={num_patches} is not square."
+        )
+
+    rows = torch.arange(
+        h,
+        device=device
+    ).view(
+        h,
+        1
+    )
+
+    cols = torch.arange(
+        h,
+        device=device
+    ).view(
+        1,
+        h
+    )
+
+    # --------------------------------------------------------
+    # 2 x 2 interleaved grouping
+    # --------------------------------------------------------
+
+    group_map = (
+        (rows % 2) * 2
+        +
+        (cols % 2)
+    )
+
+    mask = (
+        group_map.reshape(-1)
+        ==
+        group_idx
+    )
+
+    mask = mask.unsqueeze(
+        0
+    ).expand(
+        batch_size,
+        -1
+    )
+
+    return mask
+
+
+# ============================================================
+# 2. Same-space masked latent predictor
+# ============================================================
+
+class MaskedLatentPredictor(nn.Module):
+    """
+    Predict the full-image Layer-L latent state from
+    the masked-context Layer-L latent state.
+
+    Both input and target live in the SAME CLIP feature space.
+
+        masked Layer18
+                ↓
+           Predictor
+                ↓
+        full Layer18 target
+
+    This removes the previous Conv1 -> Layer18
+    cross-depth regression gap.
+    """
+
+    def __init__(
+        self,
+        dim=1024,
+        hidden_dim=512,
+        dropout=0.0
+    ):
+        super().__init__()
+
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+
+        # ----------------------------------------------------
+        # Pre-normalization reduces representation scale shift.
+        # ----------------------------------------------------
+
+        self.norm = nn.LayerNorm(
+            dim
+        )
+
+        # ----------------------------------------------------
+        # Lightweight residual predictor
+        # ----------------------------------------------------
+
+        self.mlp = nn.Sequential(
+            nn.Linear(
+                dim,
+                hidden_dim
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                dropout
+            ),
+
+            nn.Linear(
+                hidden_dim,
+                dim
+            )
+        )
+
+        # ----------------------------------------------------
+        # Start close to the frozen CLIP contextual state.
+        #
+        # sigmoid(-2) ~= 0.119
+        #
+        # This avoids aggressively rewriting pretrained CLIP
+        # features at initialization.
+        # ----------------------------------------------------
+
+        self.residual_gate = nn.Parameter(
+            torch.tensor(
+                -2.0
+            )
+        )
+
+    def forward(
+        self,
+        context_latent
+    ):
+        """
+        context_latent:
+            [B, N, D]
+
+        return:
+            [B, N, D]
+        """
+
+        delta = self.mlp(
+            self.norm(
+                context_latent
+            )
+        )
+
+        gate = torch.sigmoid(
+            self.residual_gate
+        )
+
+        predicted = (
+            context_latent
+            +
+            gate
+            *
+            delta
+        )
+
+        return predicted
