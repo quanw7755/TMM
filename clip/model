@@ -1,0 +1,2948 @@
+from collections import OrderedDict
+from typing import Tuple, Union
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+import math
+from clip.adaptor import Adaptor
+from clip.spatial_world import (
+    SpatialWorldPredictor,
+    WorldResidualGeometry
+)
+
+
+def gaussian_kernel(size, sigma=2.0):
+    x = torch.arange(size, dtype=torch.float32) - (size - 1) / 2
+    y = torch.arange(size, dtype=torch.float32) - (size - 1) / 2
+    x, y = torch.meshgrid(x, y, indexing='ij')
+
+    kernel = torch.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+    return kernel
+
+
+class GEGLU(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out * 2)
+
+    def forward(self, x):
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        return x * F.gelu(gate)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.):
+        super().__init__()
+        inner_dim = int(dim * mult)
+        if dim_out is None:
+            dim_out = dim
+        project_in = nn.Sequential(
+            nn.Linear(dim, inner_dim),
+            nn.GELU()
+        ) if not glu else GEGLU(dim, inner_dim)
+
+        self.net = nn.Sequential(
+            project_in,
+            nn.Dropout(dropout),
+            nn.Linear(inner_dim, dim_out)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+# ============================================================
+# Signed Residual Fusion Head
+# ============================================================
+class SignedResidualFusionHead(nn.Module):
+    """
+    Tri-State Contextual Error Corrector.
+
+    Three actions:
+        0 -> Suppress semantic anomaly score
+        1 -> Keep semantic prediction unchanged
+        2 -> Raise semantic anomaly score
+
+    The module does NOT directly predict the final anomaly map.
+    It only predicts whether AF-CLIP should be corrected and
+    in which direction.
+    """
+
+    SUPPRESS = 0
+    KEEP = 1
+    RAISE = 2
+
+    def __init__(
+        self,
+        hidden_dim=16,
+        max_correction=0.30
+    ):
+        super().__init__()
+
+        self.hidden_dim = int(hidden_dim)
+        self.max_correction = float(max_correction)
+
+        # ====================================================
+        # Seven-channel contextual input
+        #
+        # 0 semantic logit
+        # 1 world source-z
+        # 2 world evidence
+        # 3 semantic uncertainty
+        # 4 TTA disagreement
+        # 5 local semantic context
+        # 6 local world-z context
+        # ====================================================
+
+        self.net = nn.Sequential(
+
+            nn.Conv2d(
+                7,
+                self.hidden_dim,
+                kernel_size=3,
+                padding=1,
+                bias=True
+            ),
+
+            nn.GELU(),
+
+            nn.Conv2d(
+                self.hidden_dim,
+                self.hidden_dim,
+                kernel_size=3,
+                padding=1,
+                bias=True
+            ),
+
+            nn.GELU(),
+
+            nn.Conv2d(
+                self.hidden_dim,
+                3,
+                kernel_size=1,
+                bias=True
+            )
+        )
+
+        # ====================================================
+        # Conservative initialization:
+        #
+        # initially prefer KEEP.
+        #
+        # logits:
+        #   suppress = 0
+        #   keep     = 2
+        #   raise    = 0
+        #
+        # Therefore the model initially behaves almost exactly
+        # like the frozen AF-CLIP semantic branch.
+        # ====================================================
+
+        final_conv = self.net[-1]
+
+        nn.init.zeros_(
+            final_conv.weight
+        )
+
+        nn.init.zeros_(
+            final_conv.bias
+        )
+
+        with torch.no_grad():
+
+            final_conv.bias[
+                self.KEEP
+            ] = 2.0
+
+    def forward(
+        self,
+        semantic_logit,
+        semantic_score,
+        world_z,
+        world_evidence,
+        semantic_uncertainty,
+        tta_disagreement
+    ):
+        """
+        Inputs:
+            [B,1,H,W]
+
+        Returns:
+            action_logits    [B,3,H,W]
+            action_probs     [B,3,H,W]
+            suppress_prob    [B,1,H,W]
+            keep_prob        [B,1,H,W]
+            raise_prob       [B,1,H,W]
+            action_strength  [B,1,H,W]
+            action_direction [B,1,H,W]
+            correction       [B,1,H,W]
+        """
+
+        # ====================================================
+        # Local contextual information
+        # ====================================================
+
+        local_semantic = F.avg_pool2d(
+            semantic_score.float(),
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        local_world_z = F.avg_pool2d(
+            world_z.float(),
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        # ====================================================
+        # Feature normalization
+        # ====================================================
+
+        semantic_feature = torch.tanh(
+            semantic_logit.float()
+            /
+            4.0
+        )
+
+        world_z_feature = torch.tanh(
+            world_z.float()
+            /
+            3.0
+        )
+
+        evidence_feature = torch.tanh(
+            world_evidence.float()
+        )
+
+        uncertainty_feature = (
+            semantic_uncertainty
+            .float()
+            .clamp(
+                0.0,
+                1.0
+            )
+        )
+
+        disagreement_feature = (
+            tta_disagreement
+            .float()
+            .clamp(
+                0.0,
+                1.0
+            )
+        )
+
+        local_semantic_feature = (
+            local_semantic
+            *
+            2.0
+            -
+            1.0
+        )
+
+        local_world_feature = torch.tanh(
+            local_world_z
+            /
+            3.0
+        )
+
+        fusion_input = torch.cat(
+            [
+                semantic_feature,
+                world_z_feature,
+                evidence_feature,
+                uncertainty_feature,
+                disagreement_feature,
+                local_semantic_feature,
+                local_world_feature,
+            ],
+            dim=1
+        )
+
+        # ====================================================
+        # Tri-state prediction
+        # ====================================================
+
+        action_logits = self.net(
+            fusion_input
+        )
+
+        action_probs = torch.softmax(
+            action_logits,
+            dim=1
+        )
+
+        suppress_prob = action_probs[
+            :,
+            self.SUPPRESS:self.SUPPRESS + 1
+        ]
+
+        keep_prob = action_probs[
+            :,
+            self.KEEP:self.KEEP + 1
+        ]
+
+        raise_prob = action_probs[
+            :,
+            self.RAISE:self.RAISE + 1
+        ]
+
+        # ====================================================
+        # Need-to-correct confidence
+        # ====================================================
+
+        action_strength = (
+            1.0
+            -
+            keep_prob
+        )
+
+        # ====================================================
+        # Signed direction:
+        #
+        # positive -> raise
+        # negative -> suppress
+        # ====================================================
+
+        action_direction = (
+            raise_prob
+            -
+            suppress_prob
+        )
+
+        # ====================================================
+        # Raw correction.
+        #
+        # Training/calibration only.
+        #
+        # Final Safe intervention is computed later in
+        # detect_forward_diagnostic_tta().
+        # ====================================================
+
+        correction = (
+            self.max_correction
+            *
+            action_strength
+            *
+            action_direction
+        )
+
+        return {
+            "action_logits":
+                action_logits,
+
+            "action_probs":
+                action_probs,
+
+            "suppress_prob":
+                suppress_prob,
+
+            "keep_prob":
+                keep_prob,
+
+            "raise_prob":
+                raise_prob,
+
+            "action_strength":
+                action_strength,
+
+            "action_direction":
+                action_direction,
+
+            "correction":
+                correction,
+        }
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1):
+        super().__init__()
+
+        # all conv layers have stride 1. an avgpool is performed after the second convolution when stride > 1
+        self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.relu2 = nn.ReLU(inplace=True)
+
+        self.avgpool = nn.AvgPool2d(stride) if stride > 1 else nn.Identity()
+
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.relu3 = nn.ReLU(inplace=True)
+
+        self.downsample = None
+        self.stride = stride
+
+        if stride > 1 or inplanes != planes * Bottleneck.expansion:
+            # downsampling layer is prepended with an avgpool, and the subsequent convolution has stride 1
+            self.downsample = nn.Sequential(OrderedDict([
+                ("-1", nn.AvgPool2d(stride)),
+                ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False)),
+                ("1", nn.BatchNorm2d(planes * self.expansion))
+            ]))
+
+    def forward(self, x: torch.Tensor):
+        identity = x
+
+        out = self.relu1(self.bn1(self.conv1(x)))
+        out = self.relu2(self.bn2(self.conv2(out)))
+        out = self.avgpool(out)
+        out = self.bn3(self.conv3(out))
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu3(out)
+        return out
+
+
+class AttentionPool2d(nn.Module):
+    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
+        super().__init__()
+        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
+        self.num_heads = num_heads
+
+    def forward(self, x):
+        x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
+        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
+        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        x, _ = F.multi_head_attention_forward(
+            query=x[:1], key=x, value=x,
+            embed_dim_to_check=x.shape[-1],
+            num_heads=self.num_heads,
+            q_proj_weight=self.q_proj.weight,
+            k_proj_weight=self.k_proj.weight,
+            v_proj_weight=self.v_proj.weight,
+            in_proj_weight=None,
+            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
+            bias_k=None,
+            bias_v=None,
+            add_zero_attn=False,
+            dropout_p=0,
+            out_proj_weight=self.c_proj.weight,
+            out_proj_bias=self.c_proj.bias,
+            use_separate_proj_weight=True,
+            training=self.training,
+            need_weights=False
+        )
+        return x.squeeze(0)
+
+
+class ModifiedResNet(nn.Module):
+    """
+    A ResNet class that is similar to torchvision's but contains the following changes:
+    - There are now 3 "stem" convolutions as opposed to 1, with an average pool instead of a max pool.
+    - Performs anti-aliasing strided convolutions, where an avgpool is prepended to convolutions with stride > 1
+    - The final pooling layer is a QKV attention instead of an average pool
+    """
+
+    def __init__(self, layers, output_dim, heads, input_resolution=224, width=64):
+        super().__init__()
+        self.output_dim = output_dim
+        self.input_resolution = input_resolution
+
+        # the 3-layer stem
+        self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(width // 2)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(width // 2)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(width)
+        self.relu3 = nn.ReLU(inplace=True)
+        self.avgpool = nn.AvgPool2d(2)
+
+        # residual layers
+        self._inplanes = width  # this is a *mutable* variable used during construction
+        self.layer1 = self._make_layer(width, layers[0])
+        self.layer2 = self._make_layer(width * 2, layers[1], stride=2)
+        self.layer3 = self._make_layer(width * 4, layers[2], stride=2)
+        self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
+
+        embed_dim = width * 32  # the ResNet feature dimension
+        self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim)
+
+    def _make_layer(self, planes, blocks, stride=1):
+        layers = [Bottleneck(self._inplanes, planes, stride)]
+
+        self._inplanes = planes * Bottleneck.expansion
+        for _ in range(1, blocks):
+            layers.append(Bottleneck(self._inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        def stem(x):
+            x = self.relu1(self.bn1(self.conv1(x)))
+            x = self.relu2(self.bn2(self.conv2(x)))
+            x = self.relu3(self.bn3(self.conv3(x)))
+            x = self.avgpool(x)
+            return x
+
+        x = x.type(self.conv1.weight.dtype)
+        x = stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.attnpool(x)
+
+        return x
+
+
+class LayerNorm(nn.LayerNorm):
+    """Subclass torch's LayerNorm to handle fp16."""
+
+    def forward(self, x: torch.Tensor):
+        orig_type = x.dtype
+        ret = super().forward(x.type(torch.float32))
+        return ret.type(orig_type)
+
+
+class QuickGELU(nn.Module):
+    def forward(self, x: torch.Tensor):
+        return x * torch.sigmoid(1.702 * x)
+
+
+class ResidualAttentionBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ln_1 = LayerNorm(d_model)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(d_model * 4, d_model))
+        ]))
+        self.ln_2 = LayerNorm(d_model)
+        self.attn_mask = attn_mask
+
+    def attention(self, x: torch.Tensor):
+        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+
+    def forward(self, x: torch.Tensor):
+        x = x + self.attention(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
+        super().__init__()
+        self.width = width
+        self.layers = layers
+        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        print("resblocks: ", len(self.resblocks))
+
+    def forward(self, x: torch.Tensor, fearure_layers=None, visual_prompt=None):
+        out = []
+        prefix_len = len(visual_prompt) if visual_prompt is not None else 0
+        for i in range(len(self.resblocks)):
+            if i < prefix_len:
+                x = torch.cat([visual_prompt[i:i + 1].repeat(x.size(0), 1, 1), x], dim=1)
+            x = self.resblocks[i](x)
+            if i < prefix_len:
+                x = x[:, visual_prompt[i:i + 1].size(1):]
+            if fearure_layers is not None and i + 1 in fearure_layers:
+                out.append(x)
+        if fearure_layers is None:
+            return x
+        else:
+            return out
+
+
+class VisionTransformer(nn.Module):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.output_dim = output_dim
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+
+        scale = width ** -0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.ln_pre = LayerNorm(width)
+
+        self.transformer = Transformer(width, layers, heads)
+
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        print(self.positional_embedding.size())
+
+    def forward(self, x: torch.Tensor, feature_layers=[24], visual_prompt=None):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat(
+            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
+        new_side = int((x.shape[1] - 1) ** 0.5)
+
+        # update the position embedding during inference for varied input size
+        if side != new_side:
+            new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
+            new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
+            new_pos = new_pos.reshape(x.shape[-1], new_side * new_side).transpose(0, 1)
+            self.positional_embedding.data = torch.cat([self.positional_embedding[:1, :], new_pos], 0)
+
+        x = x + self.positional_embedding.to(x.dtype)
+
+        if visual_prompt is not None:
+            x = torch.cat([x, visual_prompt[:1].repeat(x.size(0), 1, 1)], dim=1)
+        x = self.ln_pre(x)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        out = self.transformer(x, feature_layers)
+        for i, o in enumerate(out):
+            out[i] = o.permute(1, 0, 2)
+            if visual_prompt is not None:
+                out[i] = out[i][:, :-visual_prompt.size(1), :]
+        return out
+
+
+class CLIP(nn.Module):
+    def __init__(self,
+                 embed_dim: int,
+                 # vision
+                 image_resolution: int,
+                 vision_layers: Union[Tuple[int, int, int, int], int],
+                 vision_width: int,
+                 vision_patch_size: int,
+                 # text
+                 context_length: int,
+                 vocab_size: int,
+                 transformer_width: int,
+                 transformer_heads: int,
+                 transformer_layers: int
+                 ):
+        super().__init__()
+
+        self.context_length = context_length
+
+        if isinstance(vision_layers, (tuple, list)):
+            vision_heads = vision_width * 32 // 64
+            self.visual = ModifiedResNet(
+                layers=vision_layers,
+                output_dim=embed_dim,
+                heads=vision_heads,
+                input_resolution=image_resolution,
+                width=vision_width
+            )
+        else:
+            vision_heads = vision_width // 64
+            self.visual = VisionTransformer(
+                input_resolution=image_resolution,
+                patch_size=vision_patch_size,
+                width=vision_width,
+                layers=vision_layers,
+                heads=vision_heads,
+                output_dim=embed_dim
+            )
+
+        self.transformer = Transformer(
+            width=transformer_width,
+            layers=transformer_layers,
+            heads=transformer_heads,
+            attn_mask=self.build_attention_mask()
+        )
+
+        self.vocab_size = vocab_size
+        self.token_embedding = nn.Embedding(vocab_size, transformer_width)
+        self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
+        self.ln_final = LayerNorm(transformer_width)
+
+        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        self.initialize_parameters()
+
+    def initialize_parameters(self):
+        nn.init.normal_(self.token_embedding.weight, std=0.02)
+        nn.init.normal_(self.positional_embedding, std=0.01)
+
+        if isinstance(self.visual, ModifiedResNet):
+            if self.visual.attnpool is not None:
+                std = self.visual.attnpool.c_proj.in_features ** -0.5
+                nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.k_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.v_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.c_proj.weight, std=std)
+
+            for resnet_block in [self.visual.layer1, self.visual.layer2, self.visual.layer3, self.visual.layer4]:
+                for name, param in resnet_block.named_parameters():
+                    if name.endswith("bn3.weight"):
+                        nn.init.zeros_(param)
+
+        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
+        attn_std = self.transformer.width ** -0.5
+        fc_std = (2 * self.transformer.width) ** -0.5
+        for block in self.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
+        if self.text_projection is not None:
+            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
+
+    def build_attention_mask(self):
+        # lazily create causal attention mask, with full attention between the vision tokens
+        # pytorch uses additive attention mask; fill with -inf
+        mask = torch.empty(self.context_length, self.context_length)
+        mask.fill_(float("-inf"))
+        mask.triu_(1)  # zero out the lower diagonal
+        return mask
+
+    @property
+    def dtype(self):
+        return self.visual.conv1.weight.dtype
+
+    def insert(self, args, tokenizer, device):
+
+        # ========================================================
+        # Original AF-CLIP semantic prompt
+        # ========================================================
+
+        self.normal_cls_prompt = 'without defect.'
+        self.anomaly_cls_prompt = 'with defect.'
+
+        self.state_prompt_tokens = tokenizer(
+            [
+                self.normal_cls_prompt,
+                self.anomaly_cls_prompt
+            ]
+        ).to(device)
+
+        self.tokenizer = tokenizer
+        self.device = device
+
+        self.prompt_len = args.prompt_len
+
+        self.state_prompt_embedding = nn.Parameter(
+            torch.empty(
+                1,
+                args.prompt_len,
+                self.token_embedding.weight.shape[-1]
+            ).to(device)
+        )
+
+        nn.init.normal_(
+            self.state_prompt_embedding,
+            std=0.01
+        )
+
+        self.state_prompt_embedding.requires_grad_(
+            True
+        )
+
+        # ========================================================
+        # Original AF-CLIP adaptor
+        # ========================================================
+
+        visual_dim = self.visual.proj.shape[0]
+
+        self.adaptor = Adaptor(
+            inplanes=visual_dim,
+            outplanes=visual_dim
+        ).to(device)
+
+        # ========================================================
+        # Original memory bank
+        # ========================================================
+
+        self.memorybank = None
+        self.memory_backbone = None
+
+        self.neighbor_scales = [
+            1,
+            3,
+            5,
+            9
+        ]
+
+        self.gaussian_kernel = {
+
+            '3': gaussian_kernel(
+                size=3,
+                sigma=4
+            ).to(device),
+
+            '5': gaussian_kernel(
+                size=5,
+                sigma=4
+            ).to(device),
+
+            '9': gaussian_kernel(
+                size=9,
+                sigma=4
+            ).to(device),
+        }
+
+        # ========================================================
+        # NEW:
+        # Spatial World Expectation branch
+        # ========================================================
+
+        use_world = getattr(
+            args,
+            "use_world",
+            0
+        )
+
+        if use_world:
+
+            world_hidden = getattr(
+                args,
+                "world_hidden",
+                512
+            )
+
+            world_rank = getattr(
+                args,
+                "world_rank",
+                32
+            )
+
+            # ========================================================
+            # Spatial-DR predictor
+            #
+            # Isolate its initialization RNG so that enabling the
+            # world branch does not alter AF-CLIP training randomness.
+            # ========================================================
+
+            with torch.random.fork_rng(
+                    devices=[]
+            ):
+
+                torch.manual_seed(
+                    args.seed + 10000
+                )
+
+                world_predictor = (
+                    SpatialWorldPredictor(
+                        dim=visual_dim,
+                        hidden_dim=world_hidden
+                    )
+                )
+
+            self.world_predictor = (
+                world_predictor.to(
+                    device
+                )
+            )
+
+            # ========================================================
+            # Strong implementation check
+            # ========================================================
+
+            world_variant = getattr(
+                self.world_predictor,
+                "variant",
+                None
+            )
+
+            if world_variant != "spatial_dr_v1":
+                raise RuntimeError(
+                    "Wrong SpatialWorldPredictor implementation loaded. "
+                    f"Expected 'spatial_dr_v1', "
+                    f"but received '{world_variant}'."
+                )
+
+            self.world_geometry = (
+                WorldResidualGeometry(
+                    dim=visual_dim,
+                    rank=world_rank,
+                    common_mode=True
+                ).to(device)
+            )
+            self.world_geometry = (
+                WorldResidualGeometry(
+                    dim=visual_dim,
+                    rank=world_rank,
+                    common_mode=True
+                ).to(device)
+            )
+
+        else:
+
+            self.world_predictor = None
+            self.world_geometry = None
+        # ========================================================
+        # Signed Residual Fusion
+        # ========================================================
+
+        use_signed_fusion = bool(
+            getattr(
+                args,
+                "use_signed_fusion",
+                0
+            )
+        )
+
+        if use_signed_fusion:
+
+            if not use_world:
+
+                raise RuntimeError(
+                    "Signed residual fusion requires "
+                    "--use_world 1."
+                )
+
+            signed_hidden = int(
+                getattr(
+                    args,
+                    "signed_fusion_hidden",
+                    16
+                )
+            )
+
+            signed_max_correction = float(
+                getattr(
+                    args,
+                    "signed_fusion_max_correction",
+                    1.0
+                )
+            )
+
+            self.signed_fusion_head = (
+                SignedResidualFusionHead(
+                    hidden_dim=
+                    signed_hidden,
+
+                    max_correction=
+                    signed_max_correction
+                )
+                .to(
+                    device
+                )
+            )
+
+        else:
+
+            self.signed_fusion_head = None
+
+        # ============================================================
+        # Safe Fusion source calibration statistics
+        # ============================================================
+
+        self.safe_shift_q50 = None
+        self.safe_shift_q95 = None
+
+        self.safe_delta_disagree_q95 = None
+
+    def encode_state_prompt(self):
+        state_x = self.token_embedding(self.state_prompt_tokens).type(self.dtype)
+        state_x = torch.cat([self.state_prompt_embedding.repeat(2, 1, 1), state_x], dim=1)[:, :77, :]
+        state_x = state_x + self.positional_embedding.type(self.dtype)
+        state_x = state_x.permute(1, 0, 2)  # NLD -> LND
+        state_x = self.transformer(state_x)
+        state_x = state_x.permute(1, 0, 2)  # LND -> NLD
+        state_x = self.ln_final(state_x).type(self.dtype)
+        state_x = state_x[torch.arange(state_x.shape[0]), self.prompt_len + self.state_prompt_tokens.argmax(
+            dim=-1)] @ self.text_projection
+        return state_x
+
+    def get_trainable_parameters(self):
+        return list([self.state_prompt_embedding]) + list(self.adaptor.parameters())
+
+    def get_world_trainable_parameters(self):
+
+        if self.world_predictor is None:
+            return []
+
+        return list(
+            self.world_predictor.parameters()
+        )
+    def get_signed_fusion_parameters(
+        self
+    ):
+        """
+        Return ONLY Signed Residual Fusion parameters.
+        """
+
+        if (
+            self.signed_fusion_head
+            is None
+        ):
+
+            return []
+
+        return list(
+            self.signed_fusion_head
+            .parameters()
+        )
+
+    def apply_signed_residual_fusion(
+            self,
+            semantic_score,
+            world_z,
+            world_evidence,
+            tta_disagreement
+    ):
+        """
+        Tri-State error-correction inference.
+
+        This function produces RAW correction information only.
+        Safe intervention is applied in util/utils.py after TTA.
+        """
+
+        if (
+                self.signed_fusion_head
+                is None
+        ):
+            raise RuntimeError(
+                "signed_fusion_head is not initialized."
+            )
+
+        eps = 1e-5
+
+        semantic_score = (
+            semantic_score
+            .float()
+            .clamp(
+                eps,
+                1.0 - eps
+            )
+        )
+
+        target_size = (
+            semantic_score.shape[-2:]
+        )
+
+        def _resize_map(
+                value
+        ):
+            if (
+                    value.shape[-2:]
+                    !=
+                    target_size
+            ):
+                value = F.interpolate(
+                    value.float(),
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False
+                )
+
+            return value.float()
+
+        world_z = _resize_map(
+            world_z
+        )
+
+        world_evidence = _resize_map(
+            world_evidence
+        )
+
+        tta_disagreement = _resize_map(
+            tta_disagreement
+        )
+
+        semantic_logit = torch.logit(
+            semantic_score
+        )
+
+        semantic_uncertainty = (
+                4.0
+                *
+                semantic_score
+                *
+                (
+                        1.0
+                        -
+                        semantic_score
+                )
+        )
+
+        result = (
+            self
+            .signed_fusion_head(
+                semantic_logit=
+                semantic_logit,
+
+                semantic_score=
+                semantic_score,
+
+                world_z=
+                world_z,
+
+                world_evidence=
+                world_evidence,
+
+                semantic_uncertainty=
+                semantic_uncertainty,
+
+                tta_disagreement=
+                tta_disagreement
+            )
+        )
+
+        raw_correction = (
+            result[
+                "correction"
+            ]
+        )
+
+        raw_logit = (
+                semantic_logit
+                +
+                raw_correction
+        )
+
+        result[
+            "logit"
+        ] = raw_logit
+
+        result[
+            "score"
+        ] = torch.sigmoid(
+            raw_logit
+        )
+
+        result[
+            "semantic_logit"
+        ] = semantic_logit
+
+        result[
+            "uncertainty"
+        ] = semantic_uncertainty
+
+        return result
+
+    def build_tri_state_intervention(
+            self,
+            tri_result,
+            action_threshold=0.55,
+            action_temperature=0.10,
+            correction_cap=0.30,
+            consistency_trust=None
+    ):
+        """
+        Unified Tri-State intervention used by BOTH training and inference.
+
+        This function is deliberately shared between main.py and
+        util/utils.py to avoid train-inference mismatch.
+
+        tri_result must contain:
+            suppress_prob
+            keep_prob
+            raise_prob
+
+        Final correction:
+
+            delta
+            =
+            correction_cap
+            *
+            consistency_trust
+            *
+            action_gate
+            *
+            action_direction
+
+        where
+
+            action_strength = 1 - P(KEEP)
+
+            action_gate =
+                sigmoid(
+                    (action_strength - threshold)
+                    / temperature
+                )
+
+            action_direction =
+                [P(RAISE)-P(SUPPRESS)]
+                /
+                [1-P(KEEP)+eps]
+
+        The normalized action_direction separates:
+
+            "Should we modify?"
+
+        from
+
+            "Which direction should we modify?"
+        """
+
+        required_keys = [
+            "suppress_prob",
+            "keep_prob",
+            "raise_prob",
+        ]
+
+        for key in required_keys:
+
+            if key not in tri_result:
+                raise RuntimeError(
+                    "Tri-State intervention requires "
+                    f"tri_result['{key}']."
+                )
+
+        suppress_prob = (
+            tri_result[
+                "suppress_prob"
+            ]
+            .float()
+        )
+
+        keep_prob = (
+            tri_result[
+                "keep_prob"
+            ]
+            .float()
+        )
+
+        raise_prob = (
+            tri_result[
+                "raise_prob"
+            ]
+            .float()
+        )
+
+        # ========================================================
+        # 1. Need-to-correct confidence
+        # ========================================================
+
+        action_strength = (
+                1.0
+                -
+                keep_prob
+        ).clamp(
+            0.0,
+            1.0
+        )
+
+        # ========================================================
+        # 2. Direction normalization
+        #
+        # IMPORTANT:
+        #
+        # Do not use only:
+        #
+        #     raise_prob - suppress_prob
+        #
+        # because action_strength would then be implicitly counted
+        # twice.
+        # ========================================================
+
+        action_direction = (
+                                   raise_prob
+                                   -
+                                   suppress_prob
+                           ) / (
+                                   action_strength
+                                   +
+                                   1e-6
+                           )
+
+        action_direction = (
+            action_direction
+            .clamp(
+                -1.0,
+                1.0
+            )
+        )
+
+        # ========================================================
+        # 3. Action confidence gate
+        # ========================================================
+
+        threshold = float(
+            action_threshold
+        )
+
+        temperature = max(
+            float(
+                action_temperature
+            ),
+            1e-4
+        )
+
+        action_gate = torch.sigmoid(
+            (
+                    action_strength
+                    -
+                    threshold
+            )
+            /
+            temperature
+        )
+
+        # ========================================================
+        # 4. Correction cap
+        #
+        # May be:
+        #     scalar
+        # or
+        #     [B,1,1,1]
+        # ========================================================
+
+        if torch.is_tensor(
+                correction_cap
+        ):
+
+            cap = (
+                correction_cap
+                .to(
+                    device=
+                    action_strength.device,
+                    dtype=
+                    action_strength.dtype
+                )
+            )
+
+        else:
+
+            cap = (
+                action_strength
+                .new_tensor(
+                    float(
+                        correction_cap
+                    )
+                )
+            )
+
+        cap = cap.abs()
+
+        # ========================================================
+        # 5. Consistency trust
+        # ========================================================
+
+        if consistency_trust is None:
+
+            consistency = (
+                torch.ones_like(
+                    action_strength
+                )
+            )
+
+        elif torch.is_tensor(
+                consistency_trust
+        ):
+
+            consistency = (
+                consistency_trust
+                .to(
+                    device=
+                    action_strength.device,
+                    dtype=
+                    action_strength.dtype
+                )
+            )
+
+        else:
+
+            consistency = (
+                action_strength
+                .new_tensor(
+                    float(
+                        consistency_trust
+                    )
+                )
+            )
+
+        consistency = consistency.clamp(
+            0.0,
+            1.0
+        )
+
+        # ========================================================
+        # 6. Unified correction
+        # ========================================================
+
+        safe_delta = (
+                cap
+                *
+                consistency
+                *
+                action_gate
+                *
+                action_direction
+        )
+
+        # Tensor-aware clipping
+        safe_delta = torch.maximum(
+            torch.minimum(
+                safe_delta,
+                cap
+            ),
+            -cap
+        )
+
+        return {
+            "safe_delta":
+                safe_delta,
+
+            "action_strength":
+                action_strength,
+
+            "action_direction":
+                action_direction,
+
+            "action_gate":
+                action_gate,
+
+            "suppress_prob":
+                suppress_prob,
+
+            "keep_prob":
+                keep_prob,
+
+            "raise_prob":
+                raise_prob,
+        }
+    def encode_text(self, text):
+        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+        x = x + self.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x).type(self.dtype)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        return x
+
+    def encode_image(self, image, feature_layers=None):
+        return self.visual(image.type(self.dtype), feature_layers)
+
+    def encode_patch_stem(self, image):
+        """
+        Obtain patch embeddings BEFORE ViT Transformer.
+
+        Because cross-patch self-attention has not happened,
+        neighboring context tokens have not observed the
+        target patch through global attention.
+
+        Input:
+            image:
+                [B,3,H,W]
+
+        Output:
+            stem:
+                [B,N,D]
+        """
+
+        x = self.visual.conv1(
+            image.type(self.dtype)
+        )
+
+        # [B,D,H,W]
+        # ->
+        # [B,N,D]
+        x = (
+            x
+            .flatten(2)
+            .transpose(1, 2)
+        )
+
+        return x
+
+    def encode_world_pair(
+            self,
+            image,
+            args
+    ):
+        """
+        Build:
+
+            context representation:
+                pre-transformer patch stem
+
+            target representation:
+                frozen CLIP intermediate latent state
+
+        No adapted AF-CLIP feature is used in the world branch.
+        """
+
+        # ========================================================
+        # Context:
+        # raw frozen CLIP patch embeddings
+        # ========================================================
+
+        stem = self.encode_patch_stem(
+            image
+        )
+
+        # ========================================================
+        # Prediction target:
+        # frozen CLIP intermediate layer
+        # ========================================================
+
+        world_layer = getattr(
+            args,
+            "world_layer",
+            18
+        )
+
+        target_list = self.encode_image(
+            image,
+            [world_layer]
+        )
+
+        target = target_list[0]
+
+        # Remove CLS
+        target = target[
+                 :,
+                 1:,
+                 :
+                 ]
+
+        return (
+            stem.float(),
+            target.float()
+        )
+
+    def detect_world(
+            self,
+            image,
+            args
+    ):
+        """
+        Spatial-DR World inference.
+
+        Returns prediction discrepancy, residual geometry,
+        calibrated evidence, reliability and adaptive
+        residual-shift information.
+        """
+
+        if self.world_predictor is None:
+            raise RuntimeError(
+                "World predictor has not been initialized."
+            )
+
+        if self.world_geometry is None:
+            raise RuntimeError(
+                "World geometry has not been initialized."
+            )
+
+        if not self.world_geometry.ready:
+            raise RuntimeError(
+                "World residual geometry has not been calibrated."
+            )
+
+        # ========================================================
+        # 1. Frozen CLIP context / target
+        # ========================================================
+
+        stem, target = (
+            self.encode_world_pair(
+                image,
+                args
+            )
+        )
+
+        # ========================================================
+        # 2. Spatial expectation
+        # ========================================================
+
+        predicted = (
+            self.world_predictor(
+                stem
+            )
+        )
+
+        if predicted.shape != target.shape:
+            raise RuntimeError(
+                "World prediction/target shape mismatch: "
+                f"predicted={tuple(predicted.shape)}, "
+                f"target={tuple(target.shape)}"
+            )
+
+        # ========================================================
+        # 3. Direct prediction discrepancy
+        # ========================================================
+
+        pred_score = (
+            self.world_geometry
+            .prediction_score(
+                predicted,
+                target
+            )
+        )
+
+        # ========================================================
+        # 4. Residual geometry
+        # ========================================================
+
+        raw_score = (
+            self.world_geometry
+            .raw_score(
+                predicted,
+                target
+            )
+        )
+
+        source_z = (
+            self.world_geometry
+            .patch_zscore(
+                raw_score
+            )
+        )
+
+        # ========================================================
+        # 5. Evidence mode
+        # ========================================================
+
+        evidence_mode = getattr(
+            args,
+            "world_pixel_evidence_mode",
+            "hard_max"
+        )
+
+        relative_weight = getattr(
+            args,
+            "world_relative_weight",
+            0.5
+        )
+
+        relative_tau = getattr(
+            args,
+            "world_relative_tau",
+            1.0
+        )
+
+        soft_temperature = getattr(
+            args,
+            "world_soft_temperature",
+            0.5
+        )
+
+        relative_scale_floor = getattr(
+            args,
+            "world_relative_scale_floor",
+            0.25
+        )
+
+        reliability_tau = getattr(
+            args,
+            "world_reliability_tau",
+            0.5
+        )
+
+        reliability_temperature = getattr(
+            args,
+            "world_reliability_temperature",
+            0.5
+        )
+
+        shift_temperature = getattr(
+            args,
+            "world_shift_temperature",
+            1.0
+        )
+
+        # ========================================================
+        # 6. Evidence calibration
+        # ========================================================
+
+        evidence_output = (
+            self.world_geometry
+            .build_patch_evidence(
+                raw_score=
+                raw_score,
+
+                mode=
+                evidence_mode,
+
+                relative_weight=
+                relative_weight,
+
+                relative_tau=
+                relative_tau,
+
+                soft_temperature=
+                soft_temperature,
+
+                relative_scale_floor=
+                relative_scale_floor,
+
+                reliability_tau=
+                reliability_tau,
+
+                reliability_temperature=
+                reliability_temperature,
+
+                shift_temperature=
+                shift_temperature
+            )
+        )
+
+        evidence = (
+            evidence_output[
+                "evidence"
+            ]
+        )
+
+        reliability = (
+            evidence_output[
+                "reliability"
+            ]
+        )
+
+        activation_margin = (
+            evidence_output[
+                "activation_margin"
+            ]
+        )
+
+        relative_z = (
+            evidence_output[
+                "relative_z"
+            ]
+        )
+
+        combined_z = (
+            evidence_output[
+                "combined_z"
+            ]
+        )
+
+        shift_score = (
+            evidence_output[
+                "shift_score"
+            ]
+        )
+
+        adaptive_weight = (
+            evidence_output[
+                "relative_weight"
+            ]
+        )
+
+        # ========================================================
+        # 7. Patch-grid shape
+        # ========================================================
+
+        B, N = (
+            raw_score.shape
+        )
+
+        h = int(
+            math.sqrt(N)
+        )
+
+        if h * h != N:
+            raise RuntimeError(
+                f"World patch number {N} is not square."
+            )
+
+        # ========================================================
+        # 8. Maps
+        # ========================================================
+
+        pred_map = pred_score.reshape(
+            B,
+            1,
+            h,
+            h
+        )
+
+        raw_map = raw_score.reshape(
+            B,
+            1,
+            h,
+            h
+        )
+
+        source_z_map = source_z.reshape(
+            B,
+            1,
+            h,
+            h
+        )
+
+        relative_z_map = relative_z.reshape(
+            B,
+            1,
+            h,
+            h
+        )
+
+        combined_z_map = combined_z.reshape(
+            B,
+            1,
+            h,
+            h
+        )
+
+        evidence_map = evidence.reshape(
+            B,
+            1,
+            h,
+            h
+        )
+
+        reliability_map = reliability.reshape(
+            B,
+            1,
+            h,
+            h
+        )
+
+        activation_map = (
+            activation_margin
+            .reshape(
+                B,
+                1,
+                h,
+                h
+            )
+        )
+
+        # ========================================================
+        # 9. Return
+        # ========================================================
+
+        return {
+            "predicted":
+                predicted,
+
+            "target":
+                target,
+
+            "pred_score":
+                pred_score,
+
+            "pred_map":
+                pred_map,
+
+            "raw_score":
+                raw_score,
+
+            "raw_map":
+                raw_map,
+
+            "z_score":
+                source_z,
+
+            "z_map":
+                source_z_map,
+
+            "relative_z_score":
+                relative_z,
+
+            "relative_z_map":
+                relative_z_map,
+
+            "combined_z_score":
+                combined_z,
+
+            "combined_z_map":
+                combined_z_map,
+
+            "evidence_score":
+                evidence,
+
+            "evidence_map":
+                evidence_map,
+
+            "reliability_score":
+                reliability,
+
+            "reliability_map":
+                reliability_map,
+
+            "activation_score":
+                activation_margin,
+
+            "activation_map":
+                activation_map,
+
+            # ---------------------------------------------
+            # Image-level adaptive calibration diagnostics
+            # ---------------------------------------------
+
+            "shift_score":
+                shift_score.reshape(
+                    B
+                ),
+
+            "relative_weight":
+                adaptive_weight.reshape(
+                    B
+                )
+        }
+
+    def fuse_world_evidence(
+            self,
+            semantic_score,
+            world_evidence,
+            args,
+            weight=None,
+            world_reliability=None,
+            scope="pixel",
+            return_gate=False
+    ):
+        """
+        Fuse Semantic and World anomaly evidence.
+
+        Two pixel-level modes are supported.
+
+        legacy
+        ------
+        Reproduce the previous behavior:
+
+            G_sem =
+                g0 + (1-g0) * 4p(1-p)
+
+        where g0 is world_uncertainty_floor.
+
+        Therefore, World evidence always has a minimum
+        contribution even when the semantic expert is highly
+        confident.
+
+        selective
+        ---------
+        Use uncertainty-selective fusion:
+
+            G_sem =
+                [4p(1-p)]^gamma
+
+        World evidence contributes mainly where the semantic
+        expert is uncertain.
+
+        No target label or target-domain statistic is used.
+
+        Image-level fusion deliberately keeps the legacy behavior
+        in the current experiment so that only pixel fusion is
+        changed.
+
+        Parameters
+        ----------
+        semantic_score:
+            anomaly probability.
+
+        world_evidence:
+            calibrated non-negative World evidence.
+
+        args:
+            experiment arguments.
+
+        weight:
+            World fusion coefficient.
+
+        world_reliability:
+            optional [0,1] World reliability map.
+
+        scope:
+            "pixel" or "image".
+
+        return_gate:
+            if True, additionally return the effective fusion gate.
+        """
+
+        eps = 1e-5
+
+        # ========================================================
+        # 1. Fusion coefficient
+        # ========================================================
+
+        if weight is None:
+
+            weight = float(
+                getattr(
+                    args,
+                    "world_weight",
+                    0.3
+                )
+            )
+
+        else:
+
+            weight = float(
+                weight
+            )
+
+        # ========================================================
+        # 2. Semantic probability
+        # ========================================================
+
+        semantic_score = (
+            semantic_score
+            .float()
+            .clamp(
+                eps,
+                1.0 - eps
+            )
+        )
+
+        semantic_logit = torch.logit(
+            semantic_score
+        )
+
+        # ========================================================
+        # 3. Semantic uncertainty
+        #
+        # p = 0.5 -> uncertainty = 1
+        # p -> 0/1 -> uncertainty = 0
+        # ========================================================
+
+        semantic_uncertainty = (
+                4.0
+                *
+                semantic_score
+                *
+                (
+                        1.0
+                        -
+                        semantic_score
+                )
+        ).clamp(
+            0.0,
+            1.0
+        )
+
+        # ========================================================
+        # 4. Select fusion mode
+        # ========================================================
+
+        fusion_mode = getattr(
+            args,
+            "world_fusion_mode",
+            "legacy"
+        )
+
+        # --------------------------------------------------------
+        # Keep image-level fusion unchanged.
+        #
+        # The current experiment targets pixel-level fusion only.
+        # --------------------------------------------------------
+
+        if scope == "image":
+
+            effective_mode = "legacy"
+
+        elif scope == "pixel":
+
+            effective_mode = fusion_mode
+
+        else:
+
+            raise ValueError(
+                "scope must be 'pixel' or 'image', "
+                f"but got {scope}."
+            )
+
+        # ========================================================
+        # 5. Semantic fusion gate
+        # ========================================================
+
+        if effective_mode == "legacy":
+
+            uncertainty_floor = float(
+                getattr(
+                    args,
+                    "world_uncertainty_floor",
+                    0.10
+                )
+            )
+
+            uncertainty_floor = min(
+                max(
+                    uncertainty_floor,
+                    0.0
+                ),
+                1.0
+            )
+
+            semantic_gate = (
+                    uncertainty_floor
+                    +
+                    (
+                            1.0
+                            -
+                            uncertainty_floor
+                    )
+                    *
+                    semantic_uncertainty
+            )
+
+        elif effective_mode == "selective":
+
+            gate_power = float(
+                getattr(
+                    args,
+                    "world_semantic_gate_power",
+                    1.0
+                )
+            )
+
+            gate_power = max(
+                gate_power,
+                1e-6
+            )
+
+            # ----------------------------------------------------
+            # No unconditional floor.
+            #
+            # Confident semantic-normal pixels therefore receive
+            # almost no positive World correction.
+            # ----------------------------------------------------
+
+            semantic_gate = torch.pow(
+                semantic_uncertainty,
+                gate_power
+            )
+
+        else:
+
+            raise ValueError(
+                "Unsupported world_fusion_mode: "
+                f"{effective_mode}. "
+                "Expected ['legacy', 'selective']."
+            )
+
+        # ========================================================
+        # 6. Optional World reliability
+        # ========================================================
+
+        if world_reliability is None:
+
+            reliability_gate = torch.ones_like(
+                semantic_gate
+            )
+
+        else:
+
+            reliability_gate = (
+                world_reliability
+                .float()
+                .clamp(
+                    0.0,
+                    1.0
+                )
+            )
+
+            reliability_floor = float(
+                getattr(
+                    args,
+                    "world_reliability_floor",
+                    0.0
+                )
+            )
+
+            reliability_floor = min(
+                max(
+                    reliability_floor,
+                    0.0
+                ),
+                1.0
+            )
+
+            reliability_gate = (
+                    reliability_floor
+                    +
+                    (
+                            1.0
+                            -
+                            reliability_floor
+                    )
+                    *
+                    reliability_gate
+            )
+
+        # ========================================================
+        # 7. Effective fusion gate
+        # ========================================================
+
+        fusion_gate = (
+                semantic_gate
+                *
+                reliability_gate
+        )
+
+        # ========================================================
+        # 8. World evidence
+        # ========================================================
+
+        world_evidence = (
+            world_evidence
+            .float()
+            .clamp(
+                min=0.0,
+                max=10.0
+            )
+        )
+
+        # ========================================================
+        # 9. World correction
+        # ========================================================
+
+        correction = (
+                weight
+                *
+                fusion_gate
+                *
+                world_evidence
+        )
+
+        # ========================================================
+        # 10. Fused anomaly score
+        # ========================================================
+
+        fused_logit = (
+                semantic_logit
+                +
+                correction
+        )
+
+        fused_score = torch.sigmoid(
+            fused_logit
+        )
+
+        if return_gate:
+            return (
+                fused_score,
+                fusion_gate
+            )
+
+        return fused_score
+
+    def aggerate_neighbor(self, x, patchsize, stride=1):
+        if patchsize == 1:
+            return x
+        cls_token = x[:, :1, :]
+        x = x[:, 1:, :]
+        padding = patchsize // 2
+        b, l, c = x.size()
+        h = w = int(math.sqrt(l))
+        x = x.reshape(b, h, w, c).permute(0, 3, 1, 2)
+
+        x = torch.nn.functional.unfold(x, kernel_size=patchsize, padding=padding,
+                                       stride=stride)  # b, (c * r * r), h * w
+        x = x.permute(0, 2, 1).reshape(-1, c, patchsize * patchsize).permute(0, 2, 1)  # (b * h * w,  r * r, c)
+        kernel = self.gaussian_kernel[str(patchsize)].reshape(1, patchsize * patchsize, 1)
+        x = torch.sum(x * kernel, dim=1).reshape(b, l, c)
+        x = torch.cat([cls_token, x], dim=1)
+        return x
+
+    def aggerate_neighbors(
+            self,
+            img_tokens
+    ):
+
+        img_token_list = []
+
+        scales = getattr(
+            self,
+            "neighbor_scales",
+            [
+                1,
+                3,
+                5,
+                9
+            ]
+        )
+
+        for img_token in img_tokens:
+
+            for r in scales:
+                new_img_token = (
+                    self.aggerate_neighbor(
+                        img_token,
+                        r
+                    )
+                )
+
+                img_token_list.append(
+                    new_img_token
+                )
+
+        return img_token_list
+
+    def detect_encode_image(self, image, args):
+        img_tokens = self.encode_image(image, args.feature_layers)
+        img_tokens = self.aggerate_neighbors(img_tokens)
+        img_tokens = [self.visual.ln_post(self.adaptor(img_token)) @ self.visual.proj for img_token in img_tokens]
+        return img_tokens
+
+    def store_memory(self, image, args):
+        img_tokens = self.encode_image(image, args.memory_layers)
+        img_tokens = self.aggerate_neighbors(img_tokens)
+        b, l, c = img_tokens[0].size()
+        self.memorybank = [torch.nn.functional.normalize(img_token[:, 1:], dim=-1).reshape(-1, c) for img_token in
+                           img_tokens]
+
+    def detect_forward_seg(self, image, args):
+        text_features = self.encode_state_prompt()
+        text_features = torch.nn.functional.normalize(text_features, dim=-1)
+        img_tokens = self.detect_encode_image(image, args)
+        scores = 0
+        for img_token in img_tokens:
+            img_token = torch.nn.functional.normalize(img_token, dim=-1)
+            score = torch.matmul(img_token, text_features.permute(1, 0)) / 0.07
+            scores += score
+        prob = torch.softmax(scores, dim=-1)
+        cls_label = prob[:, 0, 1].view(-1)
+        predict_map = prob[:, 1:, 1]
+
+        b, l = predict_map.size()
+        h = w = int(math.sqrt(l))
+        predict_map = predict_map.reshape(b, 1, h, w)
+        return cls_label, predict_map, img_tokens
+
+    def detect_forward_memorybank(self, image, args):
+        scores = 0
+        img_tokens = self.encode_image(image, args.memory_layers)
+        img_tokens = self.aggerate_neighbors(img_tokens)
+        for i, img_token in enumerate(img_tokens):
+            img_token = torch.nn.functional.normalize(img_token, dim=-1)
+            score = (1 - torch.matmul(img_token, self.memorybank[i].T)).min(dim=-1)[0] / 2
+            scores += score[:, 1:]
+        scores = scores / len(img_tokens)
+        cls_label = torch.max(scores, dim=-1)[0]
+        b, l = scores.size()
+        h = w = int(math.sqrt(l))
+        predict_map = scores.reshape(b, 1, h, w)
+        return cls_label, predict_map
+
+    def detect_forward_diagnostic(
+            self,
+            image,
+            args
+    ):
+        """
+        Diagnostic inference for Spatial-DR.
+
+        Returns semantic, prediction error, residual geometry,
+        calibrated evidence, reliability and final fusion.
+        """
+
+        # ========================================================
+        # 1. Semantic branch
+        # ========================================================
+
+        (
+            semantic_cls,
+            semantic_map,
+            _
+        ) = self.detect_forward_seg(
+            image,
+            args
+        )
+
+        # ========================================================
+        # 2. World branch
+        # ========================================================
+
+        if self.world_predictor is None:
+            raise RuntimeError(
+                "World predictor is not initialized."
+            )
+
+        if (
+                self.world_geometry is None
+                or
+                not self.world_geometry.ready
+        ):
+            raise RuntimeError(
+                "World geometry is not ready."
+            )
+
+        world = self.detect_world(
+            image,
+            args
+        )
+
+        # ========================================================
+        # 3. Pixel maps
+        # ========================================================
+
+        world_evidence_map = world[
+            "evidence_map"
+        ]
+
+        world_reliability_map = world[
+            "reliability_map"
+        ]
+
+        if (
+                world_evidence_map.shape[-2:]
+                !=
+                semantic_map.shape[-2:]
+        ):
+            world_evidence_map = F.interpolate(
+                world_evidence_map,
+                size=
+                semantic_map.shape[-2:],
+                mode="bilinear",
+                align_corners=False
+            )
+
+        if (
+                world_reliability_map.shape[-2:]
+                !=
+                semantic_map.shape[-2:]
+        ):
+            world_reliability_map = F.interpolate(
+                world_reliability_map,
+                size=
+                semantic_map.shape[-2:],
+                mode="bilinear",
+                align_corners=False
+            )
+
+        # ========================================================
+        # 4. Final pixel fusion
+        # ========================================================
+
+        pixel_weight = getattr(
+            args,
+            "world_pixel_weight",
+            getattr(
+                args,
+                "world_weight",
+                0.3
+            )
+        )
+
+        (
+            fused_map,
+            fusion_gate_map
+        ) = self.fuse_world_evidence(
+            semantic_score=
+            semantic_map,
+
+            world_evidence=
+            world_evidence_map,
+
+            world_reliability=
+            world_reliability_map,
+
+            args=
+            args,
+
+            weight=
+            pixel_weight,
+
+            scope=
+            "pixel",
+
+            return_gate=
+            True
+        )
+
+        # ========================================================
+        # 5. Image branch
+        # ========================================================
+
+        raw_world = world[
+            "raw_score"
+        ]
+
+        topk_ratio = getattr(
+            args,
+            "world_topk",
+            0.03
+        )
+
+        k = max(
+            1,
+            int(
+                raw_world.size(1)
+                *
+                topk_ratio
+            )
+        )
+
+        world_cls_raw = (
+            raw_world
+            .topk(
+                k,
+                dim=1
+            )
+            .values
+            .mean(
+                dim=1
+            )
+        )
+
+        world_cls_evidence = (
+            self.world_geometry
+            .image_evidence(
+                world_cls_raw
+            )
+        )
+
+        image_weight = getattr(
+            args,
+            "world_image_weight",
+            getattr(
+                args,
+                "world_weight",
+                0.2
+            )
+        )
+
+        fused_cls = self.fuse_world_evidence(
+            semantic_score=
+            semantic_cls,
+
+            world_evidence=
+            world_cls_evidence,
+
+            world_reliability=
+            None,
+
+            args=
+            args,
+
+            weight=
+            image_weight,
+
+            scope=
+            "image"
+        )
+
+        # ========================================================
+        # 6. Few-shot branch
+        # ========================================================
+
+        if self.memorybank is not None:
+            (
+                cls_label_memory,
+                predict_map_memory
+            ) = self.detect_forward_memorybank(
+                image,
+                args
+            )
+
+            fused_map = (
+                    predict_map_memory
+                    +
+                    args.alpha
+                    *
+                    fused_map
+            )
+
+            fused_cls = (
+                    cls_label_memory
+                    +
+                    args.alpha
+                    *
+                    fused_cls
+            )
+
+        # ========================================================
+        # 7. Return
+        # ========================================================
+
+        return {
+            "semantic_cls":
+                semantic_cls,
+
+            "semantic_map":
+                semantic_map,
+
+            # Direct prediction discrepancy
+            "world_pred_score":
+                world["pred_score"],
+
+            "world_pred_map":
+                world["pred_map"],
+
+            # Raw residual geometry
+            "world_geo_score":
+                world["raw_score"],
+
+            "world_geo_map":
+                world["raw_map"],
+
+            # Source standardized score
+            "world_source_z_score":
+                world["z_score"],
+
+            "world_source_z_map":
+                world["z_map"],
+
+            # Image-relative score
+            "world_relative_z_score":
+                world["relative_z_score"],
+
+            "world_relative_z_map":
+                world["relative_z_map"],
+
+            # Combined coordinate
+            "world_combined_z_score":
+                world["combined_z_score"],
+
+            "world_combined_z_map":
+                world["combined_z_map"],
+
+            # Calibrated evidence
+            "world_evidence_score":
+                world["evidence_score"],
+
+            "world_evidence_map":
+                world_evidence_map,
+
+            # Reliability
+            "world_reliability_score":
+                world["reliability_score"],
+
+            "world_reliability_map":
+                world_reliability_map,
+
+            # Activation diagnostic
+            "world_activation_score":
+                world["activation_score"],
+
+            "world_activation_map":
+                world["activation_map"],
+            # ========================================================
+            # Sample-wise residual shift
+            # ========================================================
+            "world_fusion_gate_map":
+                fusion_gate_map,
+
+            "world_shift_score":
+                world[
+                    "shift_score"
+                ],
+
+            # ========================================================
+            # Adaptive relative calibration weight
+            # ========================================================
+
+            "world_relative_weight":
+                world[
+                    "relative_weight"
+                ],
+            # Final outputs
+            "fused_cls":
+                fused_cls,
+
+            "fused_map":
+                fused_map
+        }
+
+    def detect_forward(
+            self,
+            image,
+            args
+    ):
+        # ========================================================
+        # 1. Original AF-CLIP semantic expert
+        # ========================================================
+
+        (
+            cls_label,
+            predict_map,
+            _
+        ) = self.detect_forward_seg(
+            image,
+            args
+        )
+
+        # ========================================================
+        # 2. Spatial-DR world expert
+        # ========================================================
+
+        use_world = bool(
+            getattr(
+                args,
+                "use_world",
+                0
+            )
+        )
+
+        world_ready = (
+                self.world_predictor is not None
+                and
+                self.world_geometry is not None
+                and
+                self.world_geometry.ready
+        )
+
+        if (
+                use_world
+                and
+                world_ready
+        ):
+
+            world = self.detect_world(
+                image,
+                args
+            )
+
+            # ====================================================
+            # PIXEL LEVEL
+            # ====================================================
+
+            world_evidence_map = world[
+                "evidence_map"
+            ]
+
+            world_reliability_map = world[
+                "reliability_map"
+            ]
+
+            # ----------------------------------------------------
+            # Align to semantic patch map
+            # ----------------------------------------------------
+
+            if (
+                    world_evidence_map.shape[-2:]
+                    !=
+                    predict_map.shape[-2:]
+            ):
+                world_evidence_map = F.interpolate(
+                    world_evidence_map,
+                    size=
+                    predict_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False
+                )
+
+            if (
+                    world_reliability_map.shape[-2:]
+                    !=
+                    predict_map.shape[-2:]
+            ):
+                world_reliability_map = F.interpolate(
+                    world_reliability_map,
+                    size=
+                    predict_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False
+                )
+
+            pixel_weight = getattr(
+                args,
+                "world_pixel_weight",
+                getattr(
+                    args,
+                    "world_weight",
+                    0.3
+                )
+            )
+
+            predict_map = self.fuse_world_evidence(
+                semantic_score=
+                predict_map,
+
+                world_evidence=
+                world_evidence_map,
+
+                world_reliability=
+                world_reliability_map,
+
+                args=
+                args,
+
+                weight=
+                pixel_weight,
+
+                scope=
+                "pixel"
+            )
+
+            # ====================================================
+            # IMAGE LEVEL
+            #
+            # Keep image branch unchanged for this experiment.
+            # ====================================================
+
+            raw_world = world[
+                "raw_score"
+            ]
+
+            topk_ratio = getattr(
+                args,
+                "world_topk",
+                0.03
+            )
+
+            k = max(
+                1,
+                int(
+                    raw_world.size(1)
+                    *
+                    topk_ratio
+                )
+            )
+
+            world_cls_raw = (
+                raw_world
+                .topk(
+                    k,
+                    dim=1
+                )
+                .values
+                .mean(
+                    dim=1
+                )
+            )
+
+            world_cls_evidence = (
+                self.world_geometry
+                .image_evidence(
+                    world_cls_raw
+                )
+            )
+
+            image_weight = getattr(
+                args,
+                "world_image_weight",
+                getattr(
+                    args,
+                    "world_weight",
+                    0.3
+                )
+            )
+
+            # Image branch deliberately keeps old fusion behavior.
+            cls_label = self.fuse_world_evidence(
+                semantic_score=
+                cls_label,
+
+                world_evidence=
+                world_cls_evidence,
+
+                world_reliability=
+                None,
+
+                args=
+                args,
+
+                weight=
+                image_weight,
+
+                scope=
+                "image"
+            )
+
+        # ========================================================
+        # 3. Original AF-CLIP few-shot branch
+        # ========================================================
+
+        if self.memorybank is not None:
+            (
+                cls_label_memory,
+                predict_map_memory
+            ) = self.detect_forward_memorybank(
+                image,
+                args
+            )
+
+            predict_map = (
+                    predict_map_memory
+                    +
+                    args.alpha
+                    *
+                    predict_map
+            )
+
+            cls_label = (
+                    cls_label_memory
+                    +
+                    args.alpha
+                    *
+                    cls_label
+            )
+
+        return (
+            cls_label,
+            predict_map
+        )
+
+    def forward(self, image, text):
+        image_features = self.encode_image(image)
+        if isinstance(image_features, (list, tuple)):
+            image_features = image_features[0]
+        text_features = self.encode_text(text)
+        if isinstance(text_features, (list, tuple)):
+            text_features = text_features[0]
+
+        # normalized features
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+        # cosine similarity as logits
+        logit_scale = self.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ text_features.t()
+        logits_per_text = logits_per_image.t()
+
+        # shape = [global_batch_size, global_batch_size]
+        return logits_per_image, logits_per_text
+
+
+def convert_weights(model: nn.Module):
+    """Convert applicable model parameters to fp16"""
+
+    def _convert_weights_to_fp16(l):
+        if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+            l.weight.data = l.weight.data.half()
+            if l.bias is not None:
+                l.bias.data = l.bias.data.half()
+
+        if isinstance(l, nn.MultiheadAttention):
+            for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
+                tensor = getattr(l, attr)
+                if tensor is not None:
+                    tensor.data = tensor.data.half()
+
+        for name in ["text_projection", "proj"]:
+            if hasattr(l, name):
+                attr = getattr(l, name)
+                if attr is not None:
+                    attr.data = attr.data.half()
+
+    model.apply(_convert_weights_to_fp16)
+
+
+def build_model(state_dict: dict):
+    vit = "visual.proj" in state_dict
+
+    if vit:
+        vision_width = state_dict["visual.conv1.weight"].shape[0]
+        vision_layers = len(
+            [k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+        vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
+        grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
+        image_resolution = vision_patch_size * grid_size
+    else:
+        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in
+                        [1, 2, 3, 4]]
+        vision_layers = tuple(counts)
+        vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
+        output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
+        vision_patch_size = None
+        assert output_width ** 2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
+        image_resolution = output_width * 32
+
+    embed_dim = state_dict["text_projection"].shape[1]
+    context_length = state_dict["positional_embedding"].shape[0]
+    vocab_size = state_dict["token_embedding.weight"].shape[0]
+    transformer_width = state_dict["ln_final.weight"].shape[0]
+    transformer_heads = transformer_width // 64
+    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
+
+    model = CLIP(
+        embed_dim,
+        image_resolution, vision_layers, vision_width, vision_patch_size,
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
+    )
+
+    for key in ["input_resolution", "context_length", "vocab_size"]:
+        if key in state_dict:
+            del state_dict[key]
+
+    # convert_weights(model)
+    model.load_state_dict(state_dict)
+    return model.eval()
