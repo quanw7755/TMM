@@ -1,0 +1,235 @@
+import math
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn.functional as F
+
+
+def _expand_anchor(anchor: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """Broadcast a [D] or [..., D] anchor to the shape of z."""
+    if anchor.dim() == 1:
+        view_shape = [1] * (z.dim() - 1) + [anchor.shape[-1]]
+        anchor = anchor.view(*view_shape)
+    return anchor.expand_as(z)
+
+
+def sphere_log_map(
+    anchor: torch.Tensor,
+    z: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Logarithmic map on the unit hypersphere.
+
+    Args:
+        anchor: [..., D] or [D], assumed to represent the base point.
+        z:      [..., D], feature vectors.
+        eps:    numerical stability constant.
+
+    Returns:
+        Tangent vectors v = Log_anchor(z), shape identical to z.
+
+    Notes:
+        Both anchor and z are normalized internally. The geodesic norm
+        ||v||_2 equals the angular distance theta in radians.
+    """
+    z = F.normalize(z.float(), dim=-1)
+    anchor = _expand_anchor(anchor.float(), z)
+    anchor = F.normalize(anchor, dim=-1)
+
+    cos_theta = (anchor * z).sum(dim=-1, keepdim=True)
+    cos_theta = cos_theta.clamp(-1.0 + eps, 1.0 - eps)
+    theta = torch.acos(cos_theta)
+
+    tangent_direction = z - cos_theta * anchor
+    tangent_norm = tangent_direction.norm(dim=-1, keepdim=True)
+
+    # For almost identical points, the true log map tends to zero.
+    scale = theta / tangent_norm.clamp_min(eps)
+    v = tangent_direction * scale
+    v = torch.where(tangent_norm > eps, v, torch.zeros_like(v))
+    return v
+
+
+def sphere_exp_map(
+    anchor: torch.Tensor,
+    v: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Exponential map on the unit hypersphere, useful for diagnostics."""
+    anchor = _expand_anchor(anchor.float(), v)
+    anchor = F.normalize(anchor, dim=-1)
+    v = v.float()
+
+    norm_v = v.norm(dim=-1, keepdim=True)
+    direction = v / norm_v.clamp_min(eps)
+    z = torch.cos(norm_v) * anchor + torch.sin(norm_v) * direction
+    z = torch.where(norm_v > eps, z, anchor)
+    return F.normalize(z, dim=-1)
+
+
+def project_basis_to_sphere_tangent(
+    basis: torch.Tensor,
+    anchor: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Remove the anchor direction from each basis vector and re-orthogonalize.
+
+    basis:  [D, R]
+    anchor: [D]
+    """
+    basis = basis.float()
+    anchor = F.normalize(anchor.float(), dim=-1)
+
+    # Remove any radial component.
+    radial = anchor.unsqueeze(0) @ basis  # [1, R]
+    basis = basis - anchor.unsqueeze(1) * radial
+
+    # QR gives an orthonormal basis. In degenerate cases the caller should
+    # choose a smaller rank.
+    q, _ = torch.linalg.qr(basis, mode="reduced")
+    return q
+
+
+@torch.no_grad()
+def fit_tangent_subspace(
+    features: torch.Tensor,
+    anchor: torch.Tensor,
+    rank: int = 32,
+    center_shrink: float = 1.0,
+    pca_oversample: int = 8,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """
+    Fit an affine tangent subspace to auxiliary normal patch features.
+
+    The text/semantic anchor defines the spherical chart. Normal visual
+    features are first mapped into that tangent chart with Log_anchor(.).
+    We keep a tangent-space center c and fit PCA to v-c.
+
+    Args:
+        features: [N, D] normalized or unnormalized normal patch features.
+        anchor:   [D] semantic anchor.
+        rank:     tangent subspace rank.
+        center_shrink:
+            c = center_shrink * mean(Log_anchor(z)).
+            1.0 uses the full auxiliary normal visual offset.
+            0.0 forces the affine center to remain at the semantic anchor.
+        pca_oversample: extra low-rank components requested from pca_lowrank.
+
+    Returns:
+        center: [D]
+        basis:  [D, rank]
+        stats:  simple fitting diagnostics.
+    """
+    if features.dim() != 2:
+        raise ValueError(f"features must be [N,D], got {tuple(features.shape)}")
+    if features.size(0) < 2:
+        raise ValueError("At least two normal patches are required to fit geometry.")
+
+    features = F.normalize(features.float(), dim=-1)
+    anchor = F.normalize(anchor.float(), dim=-1)
+
+    anchor_batch = anchor.unsqueeze(0).expand(features.size(0), -1)
+    v = sphere_log_map(anchor_batch, features)
+
+    full_center = v.mean(dim=0)
+    center = float(center_shrink) * full_center
+    residual = v - center.unsqueeze(0)
+
+    d = residual.size(1)
+    max_rank = min(rank, d, residual.size(0) - 1)
+    if max_rank < 1:
+        raise ValueError("Requested tangent rank is invalid for the available samples.")
+
+    q = min(max_rank + pca_oversample, d, residual.size(0))
+    # Data were centered explicitly according to center_shrink.
+    _, singular_values, right_vectors = torch.pca_lowrank(
+        residual,
+        q=q,
+        center=False,
+    )
+    basis = right_vectors[:, :max_rank]
+    basis = project_basis_to_sphere_tangent(basis, anchor)
+
+    coeff = residual @ basis
+    tangent = coeff @ basis.transpose(0, 1)
+    off = residual - tangent
+
+    total_energy = residual.pow(2).sum(dim=-1)
+    off_energy = off.pow(2).sum(dim=-1)
+    ratio = off_energy / total_energy.clamp_min(1e-12)
+
+    explained = 1.0 - off_energy.mean() / total_energy.mean().clamp_min(1e-12)
+    stats = {
+        "num_samples": float(features.size(0)),
+        "rank": float(max_rank),
+        "mean_geodesic": float(v.norm(dim=-1).mean().item()),
+        "mean_off_ratio": float(ratio.mean().item()),
+        "explained_energy": float(explained.item()),
+        "top_singular": float(singular_values[0].item()) if singular_values.numel() else 0.0,
+    }
+    return center, basis, stats
+
+
+def tangent_decompose(
+    z: torch.Tensor,
+    anchor: torch.Tensor,
+    basis: torch.Tensor,
+    center: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    """
+    Decompose normalized CLIP features into tangent and off-manifold parts.
+
+    Args:
+        z:      [..., D]
+        anchor: [D]
+        basis:  [D, R], orthonormal tangent basis
+        center: [D] tangent-space affine center. If None, zero is used.
+
+    Returns dict with:
+        log_vector, residual_vector, tangent_vector, off_vector,
+        total_energy, tangent_energy, off_energy,
+        off_distance, off_ratio, raw_geo_score.
+
+    raw_geo_score = off_distance / pi in [0, 1] up to numerical error.
+    """
+    original_dtype = z.dtype
+    z_f = F.normalize(z.float(), dim=-1)
+    anchor_f = F.normalize(anchor.float(), dim=-1)
+    basis_f = basis.float()
+
+    v = sphere_log_map(anchor_f, z_f)
+
+    if center is None:
+        residual = v
+    else:
+        center_f = center.float()
+        view_shape = [1] * (v.dim() - 1) + [center_f.shape[-1]]
+        residual = v - center_f.view(*view_shape)
+
+    coeff = torch.matmul(residual, basis_f)
+    tangent = torch.matmul(coeff, basis_f.transpose(0, 1))
+    off = residual - tangent
+
+    total_energy = residual.pow(2).sum(dim=-1)
+    tangent_energy = tangent.pow(2).sum(dim=-1)
+    off_energy = off.pow(2).sum(dim=-1)
+    off_distance = torch.sqrt(off_energy + eps)
+    off_ratio = off_energy / (total_energy + eps)
+    raw_geo_score = (off_distance / math.pi).clamp(0.0, 1.0)
+
+    # Scores/energies remain fp32 for stable losses and diagnostics.
+    return {
+        "log_vector": v.to(original_dtype) if original_dtype == torch.float64 else v,
+        "residual_vector": residual,
+        "tangent_vector": tangent,
+        "off_vector": off,
+        "total_energy": total_energy,
+        "tangent_energy": tangent_energy,
+        "off_energy": off_energy,
+        "off_distance": off_distance,
+        "off_ratio": off_ratio.clamp(0.0, 1.0),
+        "raw_geo_score": raw_geo_score,
+    }
