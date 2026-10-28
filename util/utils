@@ -1,0 +1,3826 @@
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.utils
+import torch.utils.data
+from tqdm import tqdm
+from sklearn.metrics import auc, roc_auc_score, average_precision_score, precision_recall_curve
+from statistics import mean
+from numpy import ndarray
+from skimage import measure
+import pandas as pd
+from scipy.ndimage import gaussian_filter
+from clip.model import CLIP
+from torchvision import transforms
+import torch
+import numpy as np
+from dataset.mvtec import MVTecDataset
+import cv2
+from sklearn.metrics import auc
+from skimage import measure
+import pandas as pd
+from numpy import ndarray
+from statistics import mean
+import os
+from torchvision import transforms
+from clip.model import CLIP
+import copy
+from torchvision import models
+import math
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+def transform_invert(img_, transform_train):
+    if 'Normalize' in str(transform_train):
+        norm_transform = list(filter(lambda x: isinstance(x, transforms.Normalize), transform_train.transforms))
+        mean = torch.tensor(norm_transform[0].mean, dtype=img_.dtype, device=img_.device)
+        std = torch.tensor(norm_transform[0].std, dtype=img_.dtype, device=img_.device)
+        img_.mul_(std[:, None, None]).add_(mean[:, None, None])
+    return img_
+
+
+def show_cam_on_image(img, anomaly_map, alpha=0.5):
+    img = np.float32(img)
+    anomaly_map = np.float32(anomaly_map)
+    cam = alpha * img + (1 - alpha) * anomaly_map
+    return np.uint8(cam)
+
+
+def cvt2heatmap(gray):
+    gray = np.float32(gray)
+    gray = normalize(gray)
+    gray = gray * 255
+    heatmap = cv2.applyColorMap(np.uint8(gray), cv2.COLORMAP_JET)
+    return heatmap
+
+
+def normalize(pred, max_value=None, min_value=None):
+    if max_value is None or min_value is None:
+        return (pred - pred.min()) / (pred.max() - pred.min())
+    else:
+        return (pred - min_value) / (max_value - min_value)
+
+
+def apply_ad_scoremap(image, scoremap, alpha=0.5):
+    scoremap = normalize(scoremap)
+    np_image = np.asarray(image, dtype=float)
+    scoremap = (scoremap * 255).astype(np.uint8)
+    scoremap = cv2.applyColorMap(scoremap, cv2.COLORMAP_JET)
+    scoremap = cv2.cvtColor(scoremap, cv2.COLOR_BGR2RGB)
+    return (alpha * np_image + (1 - alpha) * scoremap).astype(np.uint8)
+
+
+def plot_attention(attention_weights, filename, vmax=None):
+    """
+    """
+    nrows, ncols = attention_weights.shape[0], attention_weights.shape[1]
+
+    for row in range(nrows):
+        for col in range(ncols):
+            fig, ax = plt.subplots(figsize=(10, 5))
+
+            im = ax.imshow(attention_weights[row, col],
+                           cmap='viridis',
+                           interpolation='nearest',
+                           vmax=vmax
+                           )
+            ax.axis('off')
+            file_path = f"{filename}_{row}_{col}.png"
+            if not os.path.exists(os.path.dirname(file_path)):
+                os.makedirs(os.path.dirname(file_path))
+            plt.savefig(file_path, bbox_inches='tight', pad_inches=0, transparent=True, )
+            plt.close()
+
+
+def visualize(clip_model: CLIP, test_dataset, args, transform, device):
+    cnt = 0
+    with torch.no_grad():
+        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+        cnt = 0
+        for data in test_dataloader:
+            img_paths = data[-1]
+            labels = data[1]
+            if torch.sum(labels) >= 1:
+                imgs = data[0].to(device)
+                _, anomaly_maps = clip_model.detect_forward(imgs, args)
+                anomaly_maps = F.interpolate(anomaly_maps, size=(imgs.size(-2), imgs.size(-1)),
+                                             mode='bilinear').cpu().numpy()
+                anomaly_maps = np.stack([gaussian_filter(mask, sigma=4) for mask in anomaly_maps])
+                anomaly_maps = anomaly_maps.reshape(anomaly_maps.shape[0], anomaly_maps.shape[2], anomaly_maps.shape[3])
+                imgs = transform_invert(imgs, transform)
+                gts = data[2].squeeze()
+                if len(gts.shape) == 3:
+                    pack = zip(imgs, anomaly_maps, gts, labels, img_paths)
+                else:
+                    pack = zip(imgs, anomaly_maps, labels, img_paths)
+                for p in pack:
+                    if p[-2] != 0:
+                        print(p[-1])
+                        save_file_name = '_'.join(p[-1].split('/')[-2:])
+                        ano_map = cvt2heatmap(p[1])
+                        img = cv2.cvtColor((p[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8),
+                                           cv2.COLOR_RGB2BGR)
+                        cam_map = show_cam_on_image(img, ano_map)
+                        result_path = os.path.join(args.vis_dir, '{}-shot'.format(args.fewshot),
+                                                   test_dataset.dataset_name, test_dataset.category)
+                        if not os.path.exists(result_path):
+                            os.makedirs(result_path)
+                        if len(p) == 5:
+                            gt = cvt2heatmap(p[2])
+                            cam_gt = show_cam_on_image(img, gt)
+                            res = np.concatenate((img, cam_gt, cam_map), axis=1)
+                        else:
+                            res = np.vstack((img, ano_map, cam_map))
+                        img_path = os.path.join(result_path, save_file_name)
+                        cv2.imwrite(img_path, res)
+                        cnt += 1
+
+
+def calculate_metrics(scores, labels):
+    precision, recall, thresholds = precision_recall_curve(labels, scores)
+    f1_scores = 2 * (precision * recall) / (precision + recall + 1e-16)
+    max_f1 = np.max(f1_scores)
+    roc = roc_auc_score(labels, scores)
+    ap = average_precision_score(labels, scores)
+    return {"AUROC": roc, "AP": ap, 'max-F1': max_f1}
+
+
+def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
+    """Compute the area under the curve of per-region overlaping (PRO) and 0 to 0.3 FPR
+    Args:
+        category (str): Category of product
+        masks (ndarray): All binary masks in test. masks.shape -> (num_test_data, h, w)
+        amaps (ndarray): All anomaly maps in test. amaps.shape -> (num_test_data, h, w)
+        num_th (int, optional): Number of thresholds
+    """
+
+    assert isinstance(amaps, ndarray), "type(amaps) must be ndarray"
+    assert isinstance(masks, ndarray), "type(masks) must be ndarray"
+    assert amaps.ndim == 3, "amaps.ndim must be 3 (num_test_data, h, w)"
+    assert masks.ndim == 3, "masks.ndim must be 3 (num_test_data, h, w)"
+    assert amaps.shape == masks.shape, "amaps.shape and masks.shape must be same"
+    assert set(masks.flatten()) == {0, 1}, "set(masks.flatten()) must be {0, 1}"
+    assert isinstance(num_th, int), "type(num_th) must be int"
+
+    df = pd.DataFrame([], columns=["pro", "fpr", "threshold"])
+    binary_amaps = np.zeros_like(amaps, dtype=bool)
+
+    min_th = amaps.min()
+    max_th = amaps.max()
+    delta = (max_th - min_th) / num_th
+
+    for th in np.arange(min_th, max_th, delta):
+        binary_amaps[amaps <= th] = 0
+        binary_amaps[amaps > th] = 1
+
+        pros = []
+        for binary_amap, mask in zip(binary_amaps, masks):
+            for region in measure.regionprops(measure.label(mask)):
+                axes0_ids = region.coords[:, 0]
+                axes1_ids = region.coords[:, 1]
+                tp_pixels = binary_amap[axes0_ids, axes1_ids].sum()
+                pros.append(tp_pixels / region.area)
+
+        inverse_masks = 1 - masks
+        fp_pixels = np.logical_and(inverse_masks, binary_amaps).sum()
+        fpr = fp_pixels / inverse_masks.sum()
+
+        df.loc[len(df)] = {
+            "pro": mean(pros),
+            "fpr": fpr,
+            "threshold": th
+        }
+    # Normalize FPR from 0 ~ 1 to 0 ~ 0.3
+    df = df[df["fpr"] < 0.3]
+    df["fpr"] = df["fpr"] / df["fpr"].max()
+
+    pro_auc = auc(df["fpr"], df["pro"])
+    return pro_auc
+
+
+def get_res_str(metrics):
+    score_res_str = ""
+    for key, value in metrics.items():
+        # score_res_str += '\n'
+        for item, v in value.items():
+            score_res_str += "{}_{}: {:.6f} ".format(key, item, v)
+    return score_res_str
+
+
+def cal_average_res(total_res):
+    avergae = {}
+    category_num = len(total_res)
+    for res in total_res:  # every category res
+        for key, ip in res.items():  # sample or pixel
+            if key not in avergae:
+                avergae[key] = {}
+            for m, v in ip.items():
+                if m not in avergae[key]:
+                    avergae[key][m] = 0
+                avergae[key][m] += v
+
+    for key, ip in avergae.items():
+        for m, v in ip.items():
+            avergae[key][m] = v / category_num
+
+    return avergae
+# ============================================================
+# Test-Time Augmentation
+# ============================================================
+
+def _tta_transform(
+    images,
+    transform_name
+):
+    """
+    Apply a deterministic geometric TTA transformation.
+
+    Parameters
+    ----------
+    images:
+        [B,C,H,W]
+
+    transform_name:
+        identity
+        hflip
+        vflip
+        hvflip
+        rot90
+        rot180
+        rot270
+    """
+
+    if transform_name == "identity":
+
+        return images
+
+    elif transform_name == "hflip":
+
+        return torch.flip(
+            images,
+            dims=[3]
+        )
+
+    elif transform_name == "vflip":
+
+        return torch.flip(
+            images,
+            dims=[2]
+        )
+
+    elif transform_name == "hvflip":
+
+        return torch.flip(
+            images,
+            dims=[2, 3]
+        )
+
+    elif transform_name == "rot90":
+
+        return torch.rot90(
+            images,
+            k=1,
+            dims=[2, 3]
+        )
+
+    elif transform_name == "rot180":
+
+        return torch.rot90(
+            images,
+            k=2,
+            dims=[2, 3]
+        )
+
+    elif transform_name == "rot270":
+
+        return torch.rot90(
+            images,
+            k=3,
+            dims=[2, 3]
+        )
+
+    else:
+
+        raise ValueError(
+            f"Unknown TTA transform: "
+            f"{transform_name}"
+        )
+
+
+def _tta_inverse_map(
+    anomaly_map,
+    transform_name
+):
+    """
+    Invert a geometric TTA transformation on anomaly maps.
+
+    anomaly_map:
+        [B,1,H,W]
+
+    IMPORTANT:
+        Prediction maps must be mapped back to the original
+        image coordinate system BEFORE TTA fusion.
+    """
+
+    if transform_name == "identity":
+
+        return anomaly_map
+
+    elif transform_name == "hflip":
+
+        return torch.flip(
+            anomaly_map,
+            dims=[3]
+        )
+
+    elif transform_name == "vflip":
+
+        return torch.flip(
+            anomaly_map,
+            dims=[2]
+        )
+
+    elif transform_name == "hvflip":
+
+        return torch.flip(
+            anomaly_map,
+            dims=[2, 3]
+        )
+
+    elif transform_name == "rot90":
+
+        # Forward:
+        #     +90 degree
+        #
+        # Inverse:
+        #     -90 degree = +270 degree
+        return torch.rot90(
+            anomaly_map,
+            k=3,
+            dims=[2, 3]
+        )
+
+    elif transform_name == "rot180":
+
+        return torch.rot90(
+            anomaly_map,
+            k=2,
+            dims=[2, 3]
+        )
+
+    elif transform_name == "rot270":
+
+        # Forward:
+        #     +270 degree
+        #
+        # Inverse:
+        #     +90 degree
+        return torch.rot90(
+            anomaly_map,
+            k=1,
+            dims=[2, 3]
+        )
+
+    else:
+
+        raise ValueError(
+            f"Unknown TTA transform: "
+            f"{transform_name}"
+        )
+
+
+def _get_tta_transforms(
+    tta_mode
+):
+    """
+    Return TTA transformation list.
+
+    Recommended first experiment:
+        hflip
+
+    Stronger modes are provided only for ablation.
+    """
+
+    if tta_mode == "none":
+
+        return [
+            "identity"
+        ]
+
+    elif tta_mode == "hflip":
+
+        return [
+            "identity",
+            "hflip"
+        ]
+
+    elif tta_mode == "flip4":
+
+        return [
+            "identity",
+            "hflip",
+            "vflip",
+            "hvflip"
+        ]
+
+    elif tta_mode == "rot4":
+
+        return [
+            "identity",
+            "rot90",
+            "rot180",
+            "rot270"
+        ]
+
+    else:
+
+        raise ValueError(
+            f"Unsupported tta_mode={tta_mode}"
+        )
+
+
+@torch.no_grad()
+def detect_forward_tta(
+    clip_model,
+    images,
+    args
+):
+    """
+    Test-Time Augmented inference.
+
+    Image-level prediction:
+        weighted average over transformed views.
+
+    Pixel-level prediction:
+        1. predict transformed image;
+        2. inverse-transform anomaly map;
+        3. weighted average in original coordinates.
+
+    The model itself remains unchanged.
+    """
+
+    tta_mode = getattr(
+        args,
+        "tta_mode",
+        "none"
+    )
+    # ========================================================
+    # Signed / Safe Fusion configuration
+    # ========================================================
+
+    use_signed_fusion = bool(
+        getattr(
+            args,
+            "use_signed_fusion",
+            0
+        )
+    )
+
+    use_safe_fusion = bool(
+        getattr(
+            args,
+            "use_safe_fusion",
+            0
+        )
+    )
+    transforms_list = _get_tta_transforms(
+        tta_mode
+    )
+
+    # ========================================================
+    # No TTA
+    # ========================================================
+
+    if len(transforms_list) == 1:
+
+        return clip_model.detect_forward(
+            images,
+            args
+        )
+
+    # ========================================================
+    # Identity-heavy conservative fusion
+    #
+    # For example:
+    #
+    # hflip:
+    #     0.5 identity
+    #     0.5 hflip
+    #
+    # flip4:
+    #     0.5 identity
+    #     remaining 0.5 shared by three augmentations
+    # ========================================================
+
+    identity_weight = float(
+        getattr(
+            args,
+            "tta_identity_weight",
+            0.5
+        )
+    )
+
+    identity_weight = max(
+        0.0,
+        min(
+            1.0,
+            identity_weight
+        )
+    )
+
+    num_augmented = (
+        len(transforms_list)
+        -
+        1
+    )
+
+    if num_augmented > 0:
+
+        augmented_weight = (
+            1.0
+            -
+            identity_weight
+        ) / num_augmented
+
+    else:
+
+        augmented_weight = 0.0
+
+    cls_fused = None
+    map_fused = None
+
+    # ========================================================
+    # TTA inference
+    # ========================================================
+
+    for transform_name in transforms_list:
+
+        # ----------------------------------------------------
+        # Transform input
+        # ----------------------------------------------------
+
+        images_tta = _tta_transform(
+            images,
+            transform_name
+        )
+
+        # ----------------------------------------------------
+        # Run complete AF-CLIP + World model
+        # ----------------------------------------------------
+
+        cls_score_tta, anomaly_map_tta = (
+            clip_model.detect_forward(
+                images_tta,
+                args
+            )
+        )
+
+        # ----------------------------------------------------
+        # Restore anomaly map to original coordinates
+        # ----------------------------------------------------
+
+        anomaly_map_tta = _tta_inverse_map(
+            anomaly_map_tta,
+            transform_name
+        )
+
+        # ----------------------------------------------------
+        # Fusion weight
+        # ----------------------------------------------------
+
+        if transform_name == "identity":
+
+            weight = identity_weight
+
+        else:
+
+            weight = augmented_weight
+
+        # ----------------------------------------------------
+        # Image score fusion
+        # ----------------------------------------------------
+
+        if cls_fused is None:
+
+            cls_fused = (
+                weight
+                *
+                cls_score_tta.float()
+            )
+
+        else:
+
+            cls_fused = (
+                cls_fused
+                +
+                weight
+                *
+                cls_score_tta.float()
+            )
+
+        # ----------------------------------------------------
+        # Pixel map fusion
+        # ----------------------------------------------------
+
+        if map_fused is None:
+
+            map_fused = (
+                weight
+                *
+                anomaly_map_tta.float()
+            )
+
+        else:
+
+            map_fused = (
+                map_fused
+                +
+                weight
+                *
+                anomaly_map_tta.float()
+            )
+
+    return (
+        cls_fused,
+        map_fused
+    )
+
+
+# ============================================================
+# TTA + Spatial-DR diagnostic inference
+# ============================================================
+
+def _get_tta_weights(
+    transforms_list,
+    identity_weight=0.5
+):
+    """
+    Build TTA fusion weights.
+
+    Examples
+    --------
+    none:
+        identity = 1.0
+
+    hflip:
+        identity = 0.5
+        hflip    = 0.5
+
+    flip4:
+        identity = 0.5
+        each augmentation = 0.5 / 3
+
+    rot4:
+        identity = 0.5
+        each remaining rotation = 0.5 / 3
+    """
+
+    if len(transforms_list) == 0:
+
+        raise RuntimeError(
+            "TTA transform list is empty."
+        )
+
+    # ========================================================
+    # Identity only
+    # ========================================================
+
+    if len(transforms_list) == 1:
+
+        return {
+            transforms_list[0]: 1.0
+        }
+
+    identity_weight = float(
+        identity_weight
+    )
+
+    identity_weight = max(
+        0.0,
+        min(
+            1.0,
+            identity_weight
+        )
+    )
+
+    num_augmented = (
+        len(transforms_list)
+        -
+        1
+    )
+
+    augmented_weight = (
+        1.0
+        -
+        identity_weight
+    ) / max(
+        num_augmented,
+        1
+    )
+
+    weights = {}
+
+    for transform_name in transforms_list:
+
+        if transform_name == "identity":
+
+            weights[
+                transform_name
+            ] = identity_weight
+
+        else:
+
+            weights[
+                transform_name
+            ] = augmented_weight
+
+    return weights
+
+
+def _inverse_patch_score_tta(
+    patch_score,
+    reference_map,
+    transform_name
+):
+    """
+    Restore patch-level [B,N] scores from a transformed TTA
+    view back to the original spatial coordinates.
+
+    Parameters
+    ----------
+    patch_score:
+        Tensor [B,N].
+
+    reference_map:
+        Corresponding spatial tensor [B,1,h,w].
+        Only its spatial shape is used.
+
+    transform_name:
+        TTA transformation name.
+
+    Returns
+    -------
+    Tensor [B,N] aligned to the original image coordinates.
+
+    Why this is necessary
+    ---------------------
+    For hflip, for example, patch index 0 in the transformed
+    image does NOT correspond to patch index 0 in the original
+    image.
+
+    Therefore averaging [B,N] directly across TTA views would
+    be spatially incorrect.
+
+    The score must first be reshaped to its patch grid,
+    inverse-transformed, and only then flattened again.
+    """
+
+    if patch_score.ndim != 2:
+
+        raise RuntimeError(
+            "patch_score must have shape [B,N], "
+            f"but got {tuple(patch_score.shape)}."
+        )
+
+    if reference_map.ndim != 4:
+
+        raise RuntimeError(
+            "reference_map must have shape [B,C,H,W], "
+            f"but got {tuple(reference_map.shape)}."
+        )
+
+    B, N = patch_score.shape
+
+    h = reference_map.shape[-2]
+    w = reference_map.shape[-1]
+
+    if h * w != N:
+
+        raise RuntimeError(
+            "Patch score / spatial map mismatch: "
+            f"N={N}, map={h}x{w}={h*w}."
+        )
+
+    patch_map = patch_score.reshape(
+        B,
+        1,
+        h,
+        w
+    )
+
+    patch_map = _tta_inverse_map(
+        patch_map,
+        transform_name
+    )
+
+    patch_score_restored = (
+        patch_map
+        .reshape(
+            B,
+            -1
+        )
+    )
+
+    return patch_score_restored
+
+@torch.no_grad()
+def detect_forward_diagnostic_tta(
+    clip_model,
+    images,
+    args
+):
+    """
+    TTA Spatial-DR inference with Tri-State Safe Residual Correction V3.1.
+
+    Each TTA view independently produces Semantic and World evidence,
+    which is inverse-transformed back to the original coordinates and
+    then fused.
+
+    Final pixel prediction:
+
+        l_final
+        =
+        l_semantic
+        +
+        m_shift
+        *
+        rho_consistency
+        *
+        g_action
+        *
+        d_action
+
+    where:
+        m_shift:
+            domain-adaptive correction magnitude cap;
+
+        rho_consistency:
+            correction consistency across TTA views;
+
+        g_action:
+            Tri-State action-confidence gate;
+
+        d_action:
+            normalized Raise/Suppress direction.
+
+    Semantic prediction remains the anchor. Image-level prediction is
+    kept equal to the Semantic branch in this V3.1 pixel experiment.
+    """
+
+    # ========================================================
+    # 1. TTA configuration
+    # ========================================================
+
+    tta_mode = getattr(
+        args,
+        "tta_mode",
+        "none"
+    )
+
+    transforms_list = _get_tta_transforms(
+        tta_mode
+    )
+
+    identity_weight = float(
+        getattr(
+            args,
+            "tta_identity_weight",
+            0.5
+        )
+    )
+
+    tta_weights = _get_tta_weights(
+        transforms_list,
+        identity_weight=
+            identity_weight
+    )
+
+    # ========================================================
+    # 2. Quantities to aggregate
+    # ========================================================
+
+    spatial_map_keys = [
+        "semantic_map",
+
+        "world_pred_map",
+        "world_geo_map",
+
+        "world_source_z_map",
+        "world_relative_z_map",
+        "world_combined_z_map",
+
+        "world_evidence_map",
+        "world_reliability_map",
+        "world_activation_map",
+
+        "world_fusion_gate_map",
+
+        "fused_map",
+    ]
+
+    patch_score_map_pairs = {
+        "world_pred_score":
+            "world_pred_map",
+
+        "world_geo_score":
+            "world_geo_map",
+
+        "world_source_z_score":
+            "world_source_z_map",
+
+        "world_relative_z_score":
+            "world_relative_z_map",
+
+        "world_combined_z_score":
+            "world_combined_z_map",
+
+        "world_evidence_score":
+            "world_evidence_map",
+
+        "world_reliability_score":
+            "world_reliability_map",
+
+        "world_activation_score":
+            "world_activation_map",
+    }
+
+    scalar_keys = [
+        "semantic_cls",
+        "fused_cls",
+        "world_shift_score",
+        "world_relative_weight",
+    ]
+
+    diagnostic_fused = {}
+
+    identity_output = None
+
+    # Keep aligned per-view quantities for correction consistency.
+    aligned_view_inputs = []
+
+    # ========================================================
+    # 3. TTA views
+    # ========================================================
+
+    for transform_name in transforms_list:
+
+        weight = float(
+            tta_weights[
+                transform_name
+            ]
+        )
+
+        images_tta = _tta_transform(
+            images,
+            transform_name
+        )
+
+        diagnostic_tta = (
+            clip_model
+            .detect_forward_diagnostic(
+                images_tta,
+                args
+            )
+        )
+
+        if transform_name == "identity":
+
+            identity_output = (
+                diagnostic_tta
+            )
+
+        # ====================================================
+        # 3.1 Spatial maps
+        # ====================================================
+
+        aligned_maps = {}
+
+        for key in spatial_map_keys:
+
+            if key not in diagnostic_tta:
+
+                continue
+
+            value = (
+                diagnostic_tta[
+                    key
+                ]
+                .float()
+            )
+
+            if value.ndim != 4:
+
+                raise RuntimeError(
+                    f"TTA map '{key}' must be [B,C,H,W], "
+                    f"got {tuple(value.shape)}."
+                )
+
+            value = _tta_inverse_map(
+                value,
+                transform_name
+            )
+
+            aligned_maps[
+                key
+            ] = value
+
+            if key not in diagnostic_fused:
+
+                diagnostic_fused[
+                    key
+                ] = (
+                    weight
+                    *
+                    value
+                )
+
+            else:
+
+                diagnostic_fused[
+                    key
+                ] = (
+                    diagnostic_fused[
+                        key
+                    ]
+                    +
+                    weight
+                    *
+                    value
+                )
+
+        # ====================================================
+        # 3.2 Source-z fallback
+        # ====================================================
+
+        if (
+            "world_source_z_map"
+            in aligned_maps
+        ):
+
+            aligned_world_z = (
+                aligned_maps[
+                    "world_source_z_map"
+                ]
+            )
+
+        else:
+
+            raw_geo_score = (
+                diagnostic_tta[
+                    "world_geo_score"
+                ]
+                .float()
+            )
+
+            source_z_score = (
+                clip_model
+                .world_geometry
+                .patch_zscore(
+                    raw_geo_score
+                )
+            )
+
+            geo_map = (
+                diagnostic_tta[
+                    "world_geo_map"
+                ]
+            )
+
+            h = int(
+                geo_map.shape[-2]
+            )
+
+            w = int(
+                geo_map.shape[-1]
+            )
+
+            source_z_map = (
+                source_z_score
+                .reshape(
+                    source_z_score.size(0),
+                    1,
+                    h,
+                    w
+                )
+            )
+
+            aligned_world_z = (
+                _tta_inverse_map(
+                    source_z_map,
+                    transform_name
+                )
+            )
+
+        if (
+            "semantic_map"
+            not in aligned_maps
+            or
+            "world_evidence_map"
+            not in aligned_maps
+        ):
+
+            raise RuntimeError(
+                "TTA diagnostic output must contain "
+                "'semantic_map' and 'world_evidence_map'."
+            )
+
+        aligned_view_inputs.append(
+            {
+                "weight":
+                    weight,
+
+                "semantic":
+                    aligned_maps[
+                        "semantic_map"
+                    ],
+
+                "world_z":
+                    aligned_world_z,
+
+                "evidence":
+                    aligned_maps[
+                        "world_evidence_map"
+                    ],
+            }
+        )
+
+        # ====================================================
+        # 3.3 Patch-level scores
+        # ====================================================
+
+        for (
+            score_key,
+            map_key
+        ) in patch_score_map_pairs.items():
+
+            if (
+                score_key
+                not in
+                diagnostic_tta
+            ):
+
+                continue
+
+            if (
+                map_key
+                not in
+                diagnostic_tta
+            ):
+
+                continue
+
+            score_value = (
+                diagnostic_tta[
+                    score_key
+                ]
+                .float()
+            )
+
+            map_value = (
+                diagnostic_tta[
+                    map_key
+                ]
+                .float()
+            )
+
+            score_value = (
+                _inverse_patch_score_tta(
+                    patch_score=
+                        score_value,
+
+                    reference_map=
+                        map_value,
+
+                    transform_name=
+                        transform_name
+                )
+            )
+
+            if score_key not in diagnostic_fused:
+
+                diagnostic_fused[
+                    score_key
+                ] = (
+                    weight
+                    *
+                    score_value
+                )
+
+            else:
+
+                diagnostic_fused[
+                    score_key
+                ] = (
+                    diagnostic_fused[
+                        score_key
+                    ]
+                    +
+                    weight
+                    *
+                    score_value
+                )
+
+        # ====================================================
+        # 3.4 Sample/image-level values
+        # ====================================================
+
+        for key in scalar_keys:
+
+            if key not in diagnostic_tta:
+
+                continue
+
+            value = (
+                diagnostic_tta[
+                    key
+                ]
+                .float()
+            )
+
+            if key not in diagnostic_fused:
+
+                diagnostic_fused[
+                    key
+                ] = (
+                    weight
+                    *
+                    value
+                )
+
+            else:
+
+                diagnostic_fused[
+                    key
+                ] = (
+                    diagnostic_fused[
+                        key
+                    ]
+                    +
+                    weight
+                    *
+                    value
+                )
+
+    # ========================================================
+    # 4. Preserve optional identity-only outputs
+    # ========================================================
+
+    if identity_output is not None:
+
+        for (
+            key,
+            value
+        ) in identity_output.items():
+
+            if key not in diagnostic_fused:
+
+                diagnostic_fused[
+                    key
+                ] = value
+
+    # ========================================================
+    # 5. Tri-State Safe Fusion
+    # ========================================================
+
+    use_signed_fusion = bool(
+        getattr(
+            args,
+            "use_signed_fusion",
+            0
+        )
+    )
+
+    use_safe_fusion = bool(
+        getattr(
+            args,
+            "use_safe_fusion",
+            1
+        )
+    )
+
+    if (
+        use_signed_fusion
+        and
+        use_safe_fusion
+    ):
+
+        if not hasattr(
+            clip_model,
+            "build_tri_state_intervention"
+        ):
+
+            raise RuntimeError(
+                "Tri-State V3.1 requires "
+                "clip_model.build_tri_state_intervention()."
+            )
+
+        if (
+            clip_model.safe_shift_q50
+            is None
+            or
+            clip_model.safe_shift_q95
+            is None
+            or
+            clip_model.safe_delta_disagree_q95
+            is None
+        ):
+
+            raise RuntimeError(
+                "Safe Fusion calibration is missing. "
+                "Retrain/recalibrate the V3.1 fusion checkpoint."
+            )
+
+        semantic_tta = (
+            diagnostic_fused[
+                "semantic_map"
+            ]
+            .float()
+            .clamp(
+                1e-5,
+                1.0 - 1e-5
+            )
+        )
+
+        # ====================================================
+        # 5.1 Aggregate World source-z
+        # ====================================================
+
+        world_z_tta = (
+            diagnostic_fused[
+                "world_source_z_map"
+            ]
+            .float()
+            if
+            "world_source_z_map"
+            in diagnostic_fused
+            else
+            None
+        )
+
+        if world_z_tta is None:
+
+            raw_geo_score = (
+                diagnostic_fused[
+                    "world_geo_score"
+                ]
+                .float()
+            )
+
+            source_z_score = (
+                clip_model
+                .world_geometry
+                .patch_zscore(
+                    raw_geo_score
+                )
+            )
+
+            h = (
+                diagnostic_fused[
+                    "world_geo_map"
+                ]
+                .shape[-2]
+            )
+
+            w = (
+                diagnostic_fused[
+                    "world_geo_map"
+                ]
+                .shape[-1]
+            )
+
+            world_z_tta = (
+                source_z_score
+                .reshape(
+                    source_z_score.size(0),
+                    1,
+                    h,
+                    w
+                )
+            )
+
+        world_evidence_tta = (
+            diagnostic_fused[
+                "world_evidence_map"
+            ]
+            .float()
+        )
+
+        target_size = (
+            semantic_tta.shape[-2:]
+        )
+
+        if (
+            world_z_tta.shape[-2:]
+            !=
+            target_size
+        ):
+
+            world_z_tta = F.interpolate(
+                world_z_tta,
+                size=
+                    target_size,
+                mode="bilinear",
+                align_corners=False
+            )
+
+        if (
+            world_evidence_tta.shape[-2:]
+            !=
+            target_size
+        ):
+
+            world_evidence_tta = F.interpolate(
+                world_evidence_tta,
+                size=
+                    target_size,
+                mode="bilinear",
+                align_corners=False
+            )
+
+        # ====================================================
+        # 5.2 Semantic TTA disagreement
+        # ====================================================
+
+        semantic_disagreement = (
+            torch.zeros_like(
+                semantic_tta
+            )
+        )
+
+        for view in aligned_view_inputs:
+
+            semantic_view = (
+                view[
+                    "semantic"
+                ]
+            )
+
+            if (
+                semantic_view.shape[-2:]
+                !=
+                target_size
+            ):
+
+                semantic_view = F.interpolate(
+                    semantic_view,
+                    size=
+                        target_size,
+                    mode="bilinear",
+                    align_corners=False
+                )
+
+            semantic_disagreement += (
+                float(
+                    view[
+                        "weight"
+                    ]
+                )
+                *
+                torch.abs(
+                    semantic_view
+                    -
+                    semantic_tta
+                )
+            )
+
+        # ====================================================
+        # 5.3 Aggregate Tri-State prediction
+        # ====================================================
+
+        raw_result = (
+            clip_model
+            .apply_signed_residual_fusion(
+                semantic_score=
+                    semantic_tta,
+
+                world_z=
+                    world_z_tta,
+
+                world_evidence=
+                    world_evidence_tta,
+
+                tta_disagreement=
+                    semantic_disagreement
+            )
+        )
+
+        raw_intervention = (
+            clip_model
+            .build_tri_state_intervention(
+                tri_result=
+                    raw_result,
+
+                action_threshold=
+                    float(
+                        getattr(
+                            args,
+                            "safe_action_threshold",
+                            0.55
+                        )
+                    ),
+
+                action_temperature=
+                    float(
+                        getattr(
+                            args,
+                            "safe_action_temperature",
+                            0.10
+                        )
+                    ),
+
+                correction_cap=
+                    float(
+                        getattr(
+                            args,
+                            "safe_max_correction",
+                            0.30
+                        )
+                    ),
+
+                consistency_trust=
+                    None
+            )
+        )
+
+        raw_delta = (
+            raw_intervention[
+                "safe_delta"
+            ]
+        )
+
+        # ====================================================
+        # 5.4 Correction consistency across TTA views
+        # ====================================================
+
+        delta_disagreement = (
+            torch.zeros_like(
+                raw_delta
+            )
+        )
+
+        for view in aligned_view_inputs:
+
+            semantic_view = (
+                view[
+                    "semantic"
+                ]
+            )
+
+            world_z_view = (
+                view[
+                    "world_z"
+                ]
+            )
+
+            evidence_view = (
+                view[
+                    "evidence"
+                ]
+            )
+
+            if (
+                semantic_view.shape[-2:]
+                !=
+                target_size
+            ):
+
+                semantic_view = F.interpolate(
+                    semantic_view,
+                    size=
+                        target_size,
+                    mode="bilinear",
+                    align_corners=False
+                )
+
+            if (
+                world_z_view.shape[-2:]
+                !=
+                target_size
+            ):
+
+                world_z_view = F.interpolate(
+                    world_z_view,
+                    size=
+                        target_size,
+                    mode="bilinear",
+                    align_corners=False
+                )
+
+            if (
+                evidence_view.shape[-2:]
+                !=
+                target_size
+            ):
+
+                evidence_view = F.interpolate(
+                    evidence_view,
+                    size=
+                        target_size,
+                    mode="bilinear",
+                    align_corners=False
+                )
+
+            view_result = (
+                clip_model
+                .apply_signed_residual_fusion(
+                    semantic_score=
+                        semantic_view,
+
+                    world_z=
+                        world_z_view,
+
+                    world_evidence=
+                        evidence_view,
+
+                    tta_disagreement=
+                        semantic_disagreement
+                )
+            )
+
+            view_intervention = (
+                clip_model
+                .build_tri_state_intervention(
+                    tri_result=
+                        view_result,
+
+                    action_threshold=
+                        float(
+                            getattr(
+                                args,
+                                "safe_action_threshold",
+                                0.55
+                            )
+                        ),
+
+                    action_temperature=
+                        float(
+                            getattr(
+                                args,
+                                "safe_action_temperature",
+                                0.10
+                            )
+                        ),
+
+                    correction_cap=
+                        float(
+                            getattr(
+                                args,
+                                "safe_max_correction",
+                                0.30
+                            )
+                        ),
+
+                    consistency_trust=
+                        None
+                )
+            )
+
+            view_delta = (
+                view_intervention[
+                    "safe_delta"
+                ]
+            )
+
+            delta_disagreement += (
+                float(
+                    view[
+                        "weight"
+                    ]
+                )
+                *
+                torch.abs(
+                    view_delta
+                    -
+                    raw_delta
+                )
+            )
+
+        # ====================================================
+        # 5.5 Domain-shift trust
+        # ====================================================
+
+        if (
+            "world_shift_score"
+            not in
+            diagnostic_fused
+        ):
+
+            raise RuntimeError(
+                "Tri-State Safe Fusion requires "
+                "'world_shift_score'."
+            )
+
+        shift_score = (
+            diagnostic_fused[
+                "world_shift_score"
+            ]
+            .float()
+            .reshape(
+                -1,
+                1,
+                1,
+                1
+            )
+        )
+
+        shift_q50 = float(
+            clip_model.safe_shift_q50
+        )
+
+        shift_q95 = float(
+            clip_model.safe_shift_q95
+        )
+
+        shift_scale = max(
+            (
+                shift_q95
+                -
+                shift_q50
+            )
+            *
+            float(
+                getattr(
+                    args,
+                    "safe_shift_scale_multiplier",
+                    1.0
+                )
+            ),
+            0.05
+        )
+
+        domain_trust = torch.exp(
+            -
+            F.relu(
+                shift_score
+                -
+                shift_q95
+            )
+            /
+            shift_scale
+        )
+
+        domain_trust = (
+            domain_trust
+            .clamp(
+                0.0,
+                1.0
+            )
+        )
+
+        # ====================================================
+        # 5.6 Domain-adaptive correction cap
+        # ====================================================
+
+        min_correction = float(
+            getattr(
+                args,
+                "safe_min_correction",
+                0.05
+            )
+        )
+
+        max_correction = float(
+            getattr(
+                args,
+                "safe_max_correction",
+                0.30
+            )
+        )
+
+        if (
+            min_correction
+            <
+            0.0
+            or
+            max_correction
+            <=
+            0.0
+            or
+            min_correction
+            >
+            max_correction
+        ):
+
+            raise ValueError(
+                "Safe correction range is invalid: "
+                f"min={min_correction}, "
+                f"max={max_correction}."
+            )
+
+        correction_cap = (
+            min_correction
+            +
+            (
+                max_correction
+                -
+                min_correction
+            )
+            *
+            domain_trust
+        )
+
+        # ====================================================
+        # 5.7 Correction-consistency trust
+        # ====================================================
+
+        delta_q95 = max(
+            float(
+                clip_model
+                .safe_delta_disagree_q95
+            ),
+            1e-4
+        )
+
+        consistency_scale = max(
+            delta_q95
+            *
+            float(
+                getattr(
+                    args,
+                    "safe_consistency_scale_multiplier",
+                    1.0
+                )
+            ),
+            1e-4
+        )
+
+        raw_consistency = torch.exp(
+            -
+            F.relu(
+                delta_disagreement
+                -
+                delta_q95
+            )
+            /
+            consistency_scale
+        )
+
+        consistency_floor = float(
+            getattr(
+                args,
+                "safe_consistency_floor",
+                0.25
+            )
+        )
+
+        consistency_floor = min(
+            max(
+                consistency_floor,
+                0.0
+            ),
+            1.0
+        )
+
+        consistency_trust = (
+            consistency_floor
+            +
+            (
+                1.0
+                -
+                consistency_floor
+            )
+            *
+            raw_consistency
+        )
+
+        # ====================================================
+        # 5.8 FINAL V3.1 intervention
+        # ====================================================
+
+        final_intervention = (
+            clip_model
+            .build_tri_state_intervention(
+                tri_result=
+                    raw_result,
+
+                action_threshold=
+                    float(
+                        getattr(
+                            args,
+                            "safe_action_threshold",
+                            0.55
+                        )
+                    ),
+
+                action_temperature=
+                    float(
+                        getattr(
+                            args,
+                            "safe_action_temperature",
+                            0.10
+                        )
+                    ),
+
+                correction_cap=
+                    correction_cap,
+
+                consistency_trust=
+                    consistency_trust
+            )
+        )
+
+        safe_delta = (
+            final_intervention[
+                "safe_delta"
+            ]
+        )
+
+        action_strength = (
+            final_intervention[
+                "action_strength"
+            ]
+        )
+
+        action_direction = (
+            final_intervention[
+                "action_direction"
+            ]
+        )
+
+        action_gate = (
+            final_intervention[
+                "action_gate"
+            ]
+        )
+
+        suppress_prob = (
+            final_intervention[
+                "suppress_prob"
+            ]
+        )
+
+        keep_prob = (
+            final_intervention[
+                "keep_prob"
+            ]
+        )
+
+        raise_prob = (
+            final_intervention[
+                "raise_prob"
+            ]
+        )
+
+        # ====================================================
+        # 5.9 Semantic anchor
+        # ====================================================
+
+        semantic_logit = torch.logit(
+            semantic_tta.clamp(
+                1e-5,
+                1.0 - 1e-5
+            )
+        )
+
+        final_logit = (
+            semantic_logit
+            +
+            safe_delta
+        )
+
+        final_score = torch.sigmoid(
+            final_logit
+        )
+
+        # ====================================================
+        # 5.10 Pixel prediction
+        # ====================================================
+
+        diagnostic_fused[
+            "fused_map"
+        ] = final_score
+
+        # ====================================================
+        # 5.11 Image-level prediction
+        # ====================================================
+
+        diagnostic_fused[
+            "fused_cls"
+        ] = (
+            diagnostic_fused[
+                "semantic_cls"
+            ]
+        )
+
+        # ====================================================
+        # 5.12 V3.1 diagnostics
+        # ====================================================
+
+        diagnostic_fused[
+            "tri_suppress_prob_map"
+        ] = suppress_prob
+
+        diagnostic_fused[
+            "tri_keep_prob_map"
+        ] = keep_prob
+
+        diagnostic_fused[
+            "tri_raise_prob_map"
+        ] = raise_prob
+
+        diagnostic_fused[
+            "tri_action_strength_map"
+        ] = action_strength
+
+        diagnostic_fused[
+            "tri_action_direction_map"
+        ] = action_direction
+
+        diagnostic_fused[
+            "safe_action_gate_map"
+        ] = action_gate
+
+        diagnostic_fused[
+            "safe_correction_cap"
+        ] = correction_cap
+
+        diagnostic_fused[
+            "safe_domain_trust"
+        ] = domain_trust
+
+        diagnostic_fused[
+            "safe_consistency_trust_map"
+        ] = consistency_trust
+
+        diagnostic_fused[
+            "signed_raw_correction_map"
+        ] = raw_delta
+
+        diagnostic_fused[
+            "signed_safe_correction_map"
+        ] = safe_delta
+
+        diagnostic_fused[
+            "signed_delta_disagreement_map"
+        ] = delta_disagreement
+
+        diagnostic_fused[
+            "tta_disagreement_map"
+        ] = semantic_disagreement
+
+    return diagnostic_fused
+
+
+# ============================================================
+# Spatial-DR diagnostic map post-processing
+# ============================================================
+
+def _prepare_diagnostic_map(
+    score_map,
+    output_size,
+    sigma=4.0
+):
+    """
+    Apply exactly the same spatial post-processing used for
+    normal AF-CLIP anomaly-map evaluation:
+
+        patch map
+            ->
+        bilinear interpolation
+            ->
+        Gaussian smoothing
+
+    score_map:
+        [B,1,h,w]
+
+    return:
+        numpy [B,H,W]
+    """
+
+    score_map = F.interpolate(
+        score_map,
+        size=output_size,
+        mode="bilinear",
+        align_corners=False
+    )
+
+    score_map = (
+        score_map
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    score_map = np.stack([
+        gaussian_filter(
+            mask,
+            sigma=sigma
+        )
+        for mask in score_map
+    ])
+
+    if (
+        score_map.ndim == 4
+        and
+        score_map.shape[1] == 1
+    ):
+
+        score_map = (
+            score_map[
+                :,
+                0
+            ]
+        )
+
+    return score_map
+
+def evaluation_pixel(
+    clip_model: CLIP,
+    dataset_name,
+    dataloader,
+    args,
+    device
+):
+    """
+    Standard AF-CLIP / Spatial-DR evaluation with optional
+    Test-Time Augmentation.
+
+    Standard outputs
+    ----------------
+    Sample_CLS:
+        image-level anomaly classification.
+
+    Pixel:
+        pixel-level anomaly localization.
+
+    Spatial-DR diagnostics
+    ----------------------
+    Enabled when args.world_diag == 1.
+
+    TTA and World diagnostics can operate jointly.
+
+    When TTA is enabled, every transformed view independently
+    executes the complete diagnostic pipeline. All spatial
+    quantities are then inverse-aligned and fused before
+    evaluation.
+
+    Diag_Semantic:
+        TTA-fused AF-CLIP semantic anomaly map.
+
+    Diag_PredErr:
+        TTA-fused contextual prediction discrepancy.
+
+    Diag_Geo:
+        TTA-fused unexplained predictive residual geometry.
+
+    Diag_Evidence:
+        TTA-fused calibrated World evidence.
+
+    World_Activation:
+        activation rates according to the TTA-aggregated
+
+            activation_margin > 0
+
+    World_Reliability:
+        TTA-fused reliability on normal/anomaly patches.
+
+    World_FusionGate:
+        TTA-fused Semantic-World effective fusion gate.
+
+    World_Shift:
+        TTA-averaged sample-wise residual-distribution shift.
+
+    World_Mean:
+        TTA-fused patch-level mean PredErr / Geo / Evidence.
+    """
+
+    # ========================================================
+    # 1. Standard metric containers
+    # ========================================================
+
+    sample_gt_list = []
+    sample_score_list = []
+
+    pixel_gt_list = []
+    pixel_score_list = []
+
+    res = {}
+
+    # ========================================================
+    # 2. Diagnostic configuration
+    # ========================================================
+
+    world_diag = bool(
+        getattr(
+            args,
+            "world_diag",
+            0
+        )
+    )
+
+    world_diag_sigma = float(
+        getattr(
+            args,
+            "world_diag_sigma",
+            4.0
+        )
+    )
+
+    tta_mode = getattr(
+        args,
+        "tta_mode",
+        "none"
+    )
+    # ========================================================
+    # Signed / Safe Fusion configuration
+    # ========================================================
+
+    use_signed_fusion = bool(
+        getattr(
+            args,
+            "use_signed_fusion",
+            0
+        )
+    )
+
+    use_safe_fusion = bool(
+        getattr(
+            args,
+            "use_safe_fusion",
+            0
+        )
+    )
+    # ========================================================
+    # 3. Diagnostic full-resolution map containers
+    # ========================================================
+
+    diag_semantic_list = []
+    diag_pred_list = []
+    diag_geo_list = []
+    diag_evidence_list = []
+
+    # ========================================================
+    # 4. Patch counts
+    # ========================================================
+
+    diag_normal_patch_count = 0
+    diag_anomaly_patch_count = 0
+
+    # ========================================================
+    # 5. Activation statistics
+    # ========================================================
+
+    diag_normal_active_count = 0
+    diag_anomaly_active_count = 0
+
+    # ========================================================
+    # 6. Reliability statistics
+    # ========================================================
+
+    diag_reliability_normal_sum = 0.0
+    diag_reliability_anomaly_sum = 0.0
+
+    # ========================================================
+    # 7. Fusion-gate statistics
+    # ========================================================
+
+    diag_fusion_gate_normal_sum = 0.0
+    diag_fusion_gate_anomaly_sum = 0.0
+
+    # ========================================================
+    # 8. Sample-level adaptive calibration diagnostics
+    # ========================================================
+
+    diag_shift_score_list = []
+    diag_relative_weight_list = []
+
+    # ========================================================
+    # 9. Score statistics
+    # ========================================================
+
+    diag_pred_normal_sum = 0.0
+    diag_pred_anomaly_sum = 0.0
+
+    diag_geo_normal_sum = 0.0
+    diag_geo_anomaly_sum = 0.0
+
+    diag_evidence_normal_sum = 0.0
+    diag_evidence_anomaly_sum = 0.0
+
+    # ========================================================
+    # 10. Dataset capability
+    # ========================================================
+
+    dataset = dataloader.dataset
+
+    pixel_unavailable_datasets = {
+        "his",
+        "chest",
+        "oct17",
+        "br35h",
+        "headct",
+        'brainmri',
+    }
+
+    image_cls_unavailable_datasets = {
+        "isic",
+        "clinic",
+        "colon",
+        "kvasir",
+        "endo",
+    }
+
+    has_image_gt = bool(
+        getattr(
+            dataset,
+            "has_image_gt",
+            dataset_name
+            not in
+            image_cls_unavailable_datasets
+        )
+    )
+
+    if dataset_name in pixel_unavailable_datasets:
+
+        has_pixel_gt = False
+
+    else:
+
+        has_pixel_gt = bool(
+            getattr(
+                dataset,
+                "has_pixel_gt",
+                True
+            )
+        )
+
+    # ========================================================
+    # 11. Runtime configuration check
+    # ========================================================
+
+    print(
+        f"[Evaluation] dataset={dataset_name}, "
+        f"has_image_gt={has_image_gt}, "
+        f"has_pixel_gt={has_pixel_gt}, "
+        f"world_diag={world_diag}, "
+        f"tta_mode={tta_mode}, "
+        f"evidence_mode="
+        f"{getattr(args, 'world_pixel_evidence_mode', 'hard_max')}, "
+        f"base_fusion="
+        f"{getattr(args, 'world_fusion_mode', 'legacy')}, "
+        f"signed_fusion={use_signed_fusion}, "
+        f"safe_fusion={use_safe_fusion}"
+    )
+
+    # ========================================================
+    # 12. Evaluation loop
+    # ========================================================
+
+    with torch.no_grad():
+
+        for items in tqdm(
+            dataloader
+        ):
+
+            imgs, labels, gt = (
+                items[:3]
+            )
+
+            imgs = imgs.to(
+                device,
+                non_blocking=True
+            )
+
+            # =================================================
+            # 12.1 Inference
+            # =================================================
+
+            # -------------------------------------------------
+            # Path A:
+            # Safe / Signed Residual Fusion
+            #
+            # IMPORTANT:
+            # This path must be used regardless of whether
+            # the target dataset has pixel GT.
+            #
+            # Otherwise image-only datasets such as
+            # BrainMRI / Br35H bypass the new inference
+            # pipeline completely.
+            # -------------------------------------------------
+
+            if use_signed_fusion:
+
+                signed_output = (
+                    detect_forward_diagnostic_tta(
+                        clip_model=
+                        clip_model,
+
+                        images=
+                        imgs,
+
+                        args=
+                        args
+                    )
+                )
+
+                # =================================================
+                # Pixel-level prediction
+                #
+                # detect_forward_diagnostic_tta() is responsible
+                # for overwriting fused_map with Safe Signed Fusion.
+                # =================================================
+
+                predict_masks = (
+                    signed_output[
+                        "fused_map"
+                    ]
+                )
+
+                # =================================================
+                # Image-level prediction
+                #
+                # Safe Fusion is currently designed only for pixel
+                # localization.
+                #
+                # Therefore image classification is anchored to the
+                # original AF-CLIP Semantic prediction.
+                #
+                # This prevents the World branch from degrading
+                # BrainMRI / Br35H / BTAD image-level performance.
+                # =================================================
+
+                if use_safe_fusion:
+
+                    if (
+                            "semantic_cls"
+                            not in
+                            signed_output
+                    ):
+                        raise RuntimeError(
+                            "Safe Fusion requires "
+                            "'semantic_cls' from "
+                            "detect_forward_diagnostic_tta()."
+                        )
+
+                    predict_labels = (
+                        signed_output[
+                            "semantic_cls"
+                        ]
+                    )
+
+                else:
+
+                    predict_labels = (
+                        signed_output[
+                            "fused_cls"
+                        ]
+                    )
+
+                # =================================================
+                # Diagnostic information is required only when
+                # pixel GT actually exists.
+                #
+                # This prevents BrainMRI / Br35H from entering
+                # pixel-GT diagnostic code.
+                # =================================================
+
+                if (
+                        world_diag
+                        and
+                        has_pixel_gt
+                ):
+
+                    diagnostic_output = (
+                        signed_output
+                    )
+
+                else:
+
+                    diagnostic_output = None
+
+
+            # -------------------------------------------------
+            # Path B:
+            # Original World diagnostic inference
+            # -------------------------------------------------
+
+            elif (
+                    world_diag
+                    and
+                    has_pixel_gt
+            ):
+
+                diagnostic_output = (
+                    detect_forward_diagnostic_tta(
+                        clip_model=
+                        clip_model,
+
+                        images=
+                        imgs,
+
+                        args=
+                        args
+                    )
+                )
+
+                predict_labels = (
+                    diagnostic_output[
+                        "fused_cls"
+                    ]
+                )
+
+                predict_masks = (
+                    diagnostic_output[
+                        "fused_map"
+                    ]
+                )
+
+
+            # -------------------------------------------------
+            # Path C:
+            # Original AF-CLIP / standard TTA inference
+            # -------------------------------------------------
+
+            else:
+
+                diagnostic_output = None
+
+                (
+                    predict_labels,
+                    predict_masks
+                ) = detect_forward_tta(
+                    clip_model,
+                    imgs,
+                    args
+                )
+            # =================================================
+            # 12.2 Image-level classification
+            # =================================================
+
+            if has_image_gt:
+
+                sample_gt_list.append(
+                    labels
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                )
+
+                sample_score_list.append(
+                    predict_labels
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                )
+
+            # =================================================
+            # 12.3 Pixel-level evaluation
+            # =================================================
+
+            if has_pixel_gt:
+
+                # =============================================
+                # Diagnostic quantities
+                # =============================================
+
+                if (
+                    world_diag
+                    and
+                    diagnostic_output
+                    is not None
+                ):
+
+                    output_size = (
+                        imgs.size(-2),
+                        imgs.size(-1)
+                    )
+
+                    # =========================================
+                    # Semantic
+                    # =========================================
+
+                    semantic_diag_map = (
+                        _prepare_diagnostic_map(
+                            diagnostic_output[
+                                "semantic_map"
+                            ],
+
+                            output_size=
+                            output_size,
+
+                            sigma=
+                            world_diag_sigma
+                        )
+                    )
+
+                    # =========================================
+                    # Prediction error
+                    # =========================================
+
+                    pred_diag_map = (
+                        _prepare_diagnostic_map(
+                            diagnostic_output[
+                                "world_pred_map"
+                            ],
+
+                            output_size=
+                            output_size,
+
+                            sigma=
+                            world_diag_sigma
+                        )
+                    )
+
+                    # =========================================
+                    # Residual geometry
+                    # =========================================
+
+                    geo_diag_map = (
+                        _prepare_diagnostic_map(
+                            diagnostic_output[
+                                "world_geo_map"
+                            ],
+
+                            output_size=
+                            output_size,
+
+                            sigma=
+                            world_diag_sigma
+                        )
+                    )
+
+                    # =========================================
+                    # Calibrated evidence
+                    # =========================================
+
+                    evidence_diag_map = (
+                        _prepare_diagnostic_map(
+                            diagnostic_output[
+                                "world_evidence_map"
+                            ],
+
+                            output_size=
+                            output_size,
+
+                            sigma=
+                            world_diag_sigma
+                        )
+                    )
+
+                    diag_semantic_list.append(
+                        semantic_diag_map
+                    )
+
+                    diag_pred_list.append(
+                        pred_diag_map
+                    )
+
+                    diag_geo_list.append(
+                        geo_diag_map
+                    )
+
+                    diag_evidence_list.append(
+                        evidence_diag_map
+                    )
+
+                    # =========================================
+                    # Patch-level GT
+                    # =========================================
+
+                    gt_device = (
+                        gt
+                        .to(
+                            device,
+                            non_blocking=True
+                        )
+                        .float()
+                    )
+
+                    if gt_device.ndim == 3:
+
+                        gt_device = (
+                            gt_device
+                            .unsqueeze(1)
+                        )
+
+                    if gt_device.ndim != 4:
+
+                        raise RuntimeError(
+                            "Pixel GT must have shape "
+                            "[B,1,H,W] or [B,H,W], "
+                            f"but got "
+                            f"{tuple(gt_device.shape)}."
+                        )
+
+                    world_patch_size = (
+                        diagnostic_output[
+                            "world_evidence_map"
+                        ]
+                        .shape[-2:]
+                    )
+
+                    # -----------------------------------------
+                    # Original-coordinate GT is directly
+                    # downsampled to the already inverse-aligned
+                    # TTA World patch grid.
+                    # -----------------------------------------
+
+                    gt_patch = F.interpolate(
+                        gt_device,
+                        size=
+                        world_patch_size,
+                        mode="nearest"
+                    )
+
+                    gt_patch = (
+                        gt_patch
+                        >
+                        0.5
+                    )
+
+                    gt_patch = (
+                        gt_patch
+                        .reshape(
+                            gt_patch.size(0),
+                            -1
+                        )
+                    )
+
+                    # =========================================
+                    # TTA-fused patch-level scores
+                    # =========================================
+
+                    pred_score_patch = (
+                        diagnostic_output[
+                            "world_pred_score"
+                        ]
+                        .float()
+                    )
+
+                    geo_score_patch = (
+                        diagnostic_output[
+                            "world_geo_score"
+                        ]
+                        .float()
+                    )
+
+                    evidence_score_patch = (
+                        diagnostic_output[
+                            "world_evidence_score"
+                        ]
+                        .float()
+                    )
+
+                    activation_score_patch = (
+                        diagnostic_output[
+                            "world_activation_score"
+                        ]
+                        .float()
+                    )
+
+                    reliability_score_patch = (
+                        diagnostic_output[
+                            "world_reliability_score"
+                        ]
+                        .float()
+                    )
+
+                    # =========================================
+                    # Effective TTA-fused fusion gate
+                    # =========================================
+
+                    if (
+                        "world_fusion_gate_map"
+                        not in
+                        diagnostic_output
+                    ):
+
+                        raise RuntimeError(
+                            "Diagnostic output must return "
+                            "'world_fusion_gate_map'."
+                        )
+
+                    fusion_gate_map = (
+                        diagnostic_output[
+                            "world_fusion_gate_map"
+                        ]
+                        .float()
+                    )
+
+                    fusion_gate_patch = (
+                        fusion_gate_map
+                        .reshape(
+                            fusion_gate_map.size(0),
+                            -1
+                        )
+                    )
+
+                    # =========================================
+                    # Shift diagnostics
+                    # =========================================
+
+                    if (
+                        "world_shift_score"
+                        in diagnostic_output
+                    ):
+
+                        shift_score_batch = (
+                            diagnostic_output[
+                                "world_shift_score"
+                            ]
+                            .detach()
+                            .float()
+                            .cpu()
+                            .numpy()
+                            .reshape(-1)
+                        )
+
+                        diag_shift_score_list.append(
+                            shift_score_batch
+                        )
+
+                    if (
+                        "world_relative_weight"
+                        in diagnostic_output
+                    ):
+
+                        relative_weight_batch = (
+                            diagnostic_output[
+                                "world_relative_weight"
+                            ]
+                            .detach()
+                            .float()
+                            .cpu()
+                            .numpy()
+                            .reshape(-1)
+                        )
+
+                        diag_relative_weight_list.append(
+                            relative_weight_batch
+                        )
+
+                    # =========================================
+                    # Strong shape checks
+                    # =========================================
+
+                    expected_shape = (
+                        gt_patch.shape
+                    )
+
+                    diagnostic_patch_scores = {
+                        "PredErr":
+                            pred_score_patch,
+
+                        "Geo":
+                            geo_score_patch,
+
+                        "Evidence":
+                            evidence_score_patch,
+
+                        "Activation":
+                            activation_score_patch,
+
+                        "Reliability":
+                            reliability_score_patch,
+
+                        "FusionGate":
+                            fusion_gate_patch,
+                    }
+
+                    for (
+                        score_name,
+                        score_tensor
+                    ) in diagnostic_patch_scores.items():
+
+                        if (
+                            score_tensor.shape
+                            !=
+                            expected_shape
+                        ):
+
+                            raise RuntimeError(
+                                f"{score_name}/GT patch "
+                                "shape mismatch: "
+                                f"score="
+                                f"{tuple(score_tensor.shape)}, "
+                                f"gt="
+                                f"{tuple(expected_shape)}"
+                            )
+
+                    # =========================================
+                    # Normal / anomaly masks
+                    # =========================================
+
+                    anomaly_patch_mask = (
+                        gt_patch
+                    )
+
+                    normal_patch_mask = (
+                        ~gt_patch
+                    )
+
+                    # =========================================
+                    # TTA-aggregated activation
+                    #
+                    # IMPORTANT:
+                    # soft evidence itself is always positive.
+                    # Therefore we still use
+                    #
+                    #     activation_margin > 0
+                    #
+                    # rather than evidence > 0.
+                    # =========================================
+
+                    active_patch = (
+                        activation_score_patch
+                        >
+                        0
+                    )
+
+                    normal_count = int(
+                        normal_patch_mask
+                        .sum()
+                        .item()
+                    )
+
+                    anomaly_count = int(
+                        anomaly_patch_mask
+                        .sum()
+                        .item()
+                    )
+
+                    diag_normal_patch_count += (
+                        normal_count
+                    )
+
+                    diag_anomaly_patch_count += (
+                        anomaly_count
+                    )
+
+                    diag_normal_active_count += int(
+                        (
+                            active_patch
+                            &
+                            normal_patch_mask
+                        )
+                        .sum()
+                        .item()
+                    )
+
+                    diag_anomaly_active_count += int(
+                        (
+                            active_patch
+                            &
+                            anomaly_patch_mask
+                        )
+                        .sum()
+                        .item()
+                    )
+
+                    # =========================================
+                    # Normal-patch statistics
+                    # =========================================
+
+                    if normal_count > 0:
+
+                        diag_pred_normal_sum += float(
+                            pred_score_patch[
+                                normal_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                        diag_geo_normal_sum += float(
+                            geo_score_patch[
+                                normal_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                        diag_evidence_normal_sum += float(
+                            evidence_score_patch[
+                                normal_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                        diag_reliability_normal_sum += float(
+                            reliability_score_patch[
+                                normal_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                        diag_fusion_gate_normal_sum += float(
+                            fusion_gate_patch[
+                                normal_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                    # =========================================
+                    # Anomaly-patch statistics
+                    # =========================================
+
+                    if anomaly_count > 0:
+
+                        diag_pred_anomaly_sum += float(
+                            pred_score_patch[
+                                anomaly_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                        diag_geo_anomaly_sum += float(
+                            geo_score_patch[
+                                anomaly_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                        diag_evidence_anomaly_sum += float(
+                            evidence_score_patch[
+                                anomaly_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                        diag_reliability_anomaly_sum += float(
+                            reliability_score_patch[
+                                anomaly_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                        diag_fusion_gate_anomaly_sum += float(
+                            fusion_gate_patch[
+                                anomaly_patch_mask
+                            ]
+                            .sum()
+                            .item()
+                        )
+
+                # =============================================
+                # Final TTA-fused anomaly map
+                #
+                # Current order:
+                #
+                # per-view low-res prediction
+                # ->
+                # inverse TTA
+                # ->
+                # weighted TTA average
+                # ->
+                # interpolate
+                # ->
+                # Gaussian
+                # =============================================
+
+                predict_masks = F.interpolate(
+                    predict_masks,
+                    size=(
+                        imgs.size(-2),
+                        imgs.size(-1)
+                    ),
+                    mode="bilinear",
+                    align_corners=False
+                )
+
+                predict_masks = (
+                    predict_masks
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+
+                processed_masks = []
+
+                for mask in predict_masks:
+
+                    if (
+                        mask.ndim == 3
+                        and
+                        mask.shape[0] == 1
+                    ):
+
+                        mask = mask[0]
+
+                    mask = gaussian_filter(
+                        mask,
+                        sigma=4
+                    )
+
+                    processed_masks.append(
+                        mask
+                    )
+
+                predict_masks = np.stack(
+                    processed_masks,
+                    axis=0
+                )
+
+                # =============================================
+                # GT
+                # =============================================
+
+                gt_binary = (
+                    gt
+                    >
+                    0.5
+                ).to(
+                    torch.uint8
+                )
+
+                gt_numpy = (
+                    gt_binary
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(
+                        np.uint8
+                    )
+                )
+
+                if (
+                    gt_numpy.ndim == 4
+                    and
+                    gt_numpy.shape[1] == 1
+                ):
+
+                    gt_numpy = (
+                        gt_numpy[
+                            :,
+                            0
+                        ]
+                    )
+
+                pixel_gt_list.append(
+                    gt_numpy
+                )
+
+                pixel_score_list.append(
+                    predict_masks
+                )
+
+    # ========================================================
+    # 13. Image-level metrics
+    # ========================================================
+
+    if has_image_gt:
+
+        if len(
+            sample_gt_list
+        ) == 0:
+
+            raise RuntimeError(
+                f"No image-level labels were collected "
+                f"for dataset '{dataset_name}'."
+            )
+
+        sample_gt_array = np.concatenate(
+            sample_gt_list,
+            axis=0
+        )
+
+        sample_score_array = np.concatenate(
+            sample_score_list,
+            axis=0
+        )
+
+        unique_labels = np.unique(
+            sample_gt_array
+        )
+
+        if unique_labels.size < 2:
+
+            raise RuntimeError(
+                f"Dataset '{dataset_name}' "
+                "cannot calculate image metrics. "
+                f"Labels contain only "
+                f"{unique_labels.tolist()}."
+            )
+
+        res[
+            "Sample_CLS"
+        ] = calculate_metrics(
+            sample_score_array,
+            sample_gt_array
+        )
+
+    # ========================================================
+    # 14. Pixel-level metrics
+    # ========================================================
+
+    if has_pixel_gt:
+
+        if len(
+            pixel_gt_list
+        ) == 0:
+
+            raise RuntimeError(
+                f"Dataset '{dataset_name}' declares "
+                "has_pixel_gt=True, but no pixel masks "
+                "were collected."
+            )
+
+        pixel_gt_array = np.concatenate(
+            pixel_gt_list,
+            axis=0
+        )
+
+        pixel_score_array = np.concatenate(
+            pixel_score_list,
+            axis=0
+        )
+
+        if (
+            pixel_gt_array.ndim == 4
+            and
+            pixel_gt_array.shape[1] == 1
+        ):
+
+            pixel_gt_array = (
+                pixel_gt_array[
+                    :,
+                    0
+                ]
+            )
+
+        if (
+            pixel_score_array.ndim == 4
+            and
+            pixel_score_array.shape[1] == 1
+        ):
+
+            pixel_score_array = (
+                pixel_score_array[
+                    :,
+                    0
+                ]
+            )
+
+        unique_pixel_labels = set(
+            np.unique(
+                pixel_gt_array
+            ).tolist()
+        )
+
+        if unique_pixel_labels != {0, 1}:
+
+            raise RuntimeError(
+                f"Dataset '{dataset_name}' is expected "
+                "to calculate pixel metrics, but GT "
+                f"contains {sorted(unique_pixel_labels)}. "
+                "Both 0 and 1 are required."
+            )
+
+        # ====================================================
+        # 14.1 Final prediction
+        # ====================================================
+
+        res[
+            "Pixel"
+        ] = calculate_metrics(
+            pixel_score_array
+            .reshape(-1),
+
+            pixel_gt_array
+            .reshape(-1)
+        )
+
+        res[
+            "Pixel"
+        ][
+            "PRO"
+        ] = compute_pro(
+            pixel_gt_array,
+            pixel_score_array
+        )
+
+        # ====================================================
+        # 15. Spatial-DR diagnostics
+        # ====================================================
+
+        if (
+            world_diag
+            and
+            len(
+                diag_semantic_list
+            ) > 0
+        ):
+
+            # =================================================
+            # 15.1 Merge TTA-fused diagnostic maps
+            # =================================================
+
+            semantic_diag_array = np.concatenate(
+                diag_semantic_list,
+                axis=0
+            )
+
+            pred_diag_array = np.concatenate(
+                diag_pred_list,
+                axis=0
+            )
+
+            geo_diag_array = np.concatenate(
+                diag_geo_list,
+                axis=0
+            )
+
+            evidence_diag_array = np.concatenate(
+                diag_evidence_list,
+                axis=0
+            )
+
+            expected_shape = (
+                pixel_gt_array.shape
+            )
+
+            diagnostic_arrays = {
+                "semantic":
+                    semantic_diag_array,
+
+                "pred":
+                    pred_diag_array,
+
+                "geo":
+                    geo_diag_array,
+
+                "evidence":
+                    evidence_diag_array,
+            }
+
+            for (
+                name,
+                array
+            ) in diagnostic_arrays.items():
+
+                if (
+                    array.shape
+                    !=
+                    expected_shape
+                ):
+
+                    raise RuntimeError(
+                        f"Diagnostic map '{name}' "
+                        "shape mismatch: "
+                        f"score={array.shape}, "
+                        f"gt={expected_shape}"
+                    )
+
+            gt_flat = (
+                pixel_gt_array
+                .reshape(-1)
+            )
+
+            # =================================================
+            # 15.2 Semantic
+            # =================================================
+
+            semantic_metrics = calculate_metrics(
+                semantic_diag_array
+                .reshape(-1),
+                gt_flat
+            )
+
+            res[
+                "Diag_Semantic"
+            ] = {
+                "AUROC":
+                    semantic_metrics[
+                        "AUROC"
+                    ],
+
+                "AP":
+                    semantic_metrics[
+                        "AP"
+                    ]
+            }
+
+            # =================================================
+            # 15.3 Prediction error
+            # =================================================
+
+            pred_metrics = calculate_metrics(
+                pred_diag_array
+                .reshape(-1),
+                gt_flat
+            )
+
+            res[
+                "Diag_PredErr"
+            ] = {
+                "AUROC":
+                    pred_metrics[
+                        "AUROC"
+                    ],
+
+                "AP":
+                    pred_metrics[
+                        "AP"
+                    ]
+            }
+
+            # =================================================
+            # 15.4 Residual geometry
+            # =================================================
+
+            geo_metrics = calculate_metrics(
+                geo_diag_array
+                .reshape(-1),
+                gt_flat
+            )
+
+            res[
+                "Diag_Geo"
+            ] = {
+                "AUROC":
+                    geo_metrics[
+                        "AUROC"
+                    ],
+
+                "AP":
+                    geo_metrics[
+                        "AP"
+                    ]
+            }
+
+            # =================================================
+            # 15.5 Calibrated World evidence
+            # =================================================
+
+            evidence_metrics = calculate_metrics(
+                evidence_diag_array
+                .reshape(-1),
+                gt_flat
+            )
+
+            res[
+                "Diag_Evidence"
+            ] = {
+                "AUROC":
+                    evidence_metrics[
+                        "AUROC"
+                    ],
+
+                "AP":
+                    evidence_metrics[
+                        "AP"
+                    ]
+            }
+
+            # =================================================
+            # 15.6 Activation
+            # =================================================
+
+            if diag_normal_patch_count > 0:
+
+                r_n = (
+                    diag_normal_active_count
+                    /
+                    diag_normal_patch_count
+                )
+
+            else:
+
+                r_n = float(
+                    "nan"
+                )
+
+            if diag_anomaly_patch_count > 0:
+
+                r_a = (
+                    diag_anomaly_active_count
+                    /
+                    diag_anomaly_patch_count
+                )
+
+            else:
+
+                r_a = float(
+                    "nan"
+                )
+
+            res[
+                "World_Activation"
+            ] = {
+                "R_N":
+                    r_n,
+
+                "R_A":
+                    r_a,
+
+                "Gap":
+                    (
+                        r_a
+                        -
+                        r_n
+                    )
+            }
+
+            # =================================================
+            # 15.7 Reliability
+            # =================================================
+
+            if diag_normal_patch_count > 0:
+
+                reliability_normal_mean = (
+                    diag_reliability_normal_sum
+                    /
+                    diag_normal_patch_count
+                )
+
+            else:
+
+                reliability_normal_mean = float(
+                    "nan"
+                )
+
+            if diag_anomaly_patch_count > 0:
+
+                reliability_anomaly_mean = (
+                    diag_reliability_anomaly_sum
+                    /
+                    diag_anomaly_patch_count
+                )
+
+            else:
+
+                reliability_anomaly_mean = float(
+                    "nan"
+                )
+
+            res[
+                "World_Reliability"
+            ] = {
+                "Rel_N":
+                    reliability_normal_mean,
+
+                "Rel_A":
+                    reliability_anomaly_mean,
+
+                "Gap":
+                    (
+                        reliability_anomaly_mean
+                        -
+                        reliability_normal_mean
+                    )
+            }
+
+            # =================================================
+            # 15.8 TTA-fused effective fusion gate
+            # =================================================
+
+            if diag_normal_patch_count > 0:
+
+                fusion_gate_normal_mean = (
+                    diag_fusion_gate_normal_sum
+                    /
+                    diag_normal_patch_count
+                )
+
+            else:
+
+                fusion_gate_normal_mean = float(
+                    "nan"
+                )
+
+            if diag_anomaly_patch_count > 0:
+
+                fusion_gate_anomaly_mean = (
+                    diag_fusion_gate_anomaly_sum
+                    /
+                    diag_anomaly_patch_count
+                )
+
+            else:
+
+                fusion_gate_anomaly_mean = float(
+                    "nan"
+                )
+
+            res[
+                "World_FusionGate"
+            ] = {
+                "Gate_N":
+                    fusion_gate_normal_mean,
+
+                "Gate_A":
+                    fusion_gate_anomaly_mean,
+
+                "Gap":
+                    (
+                        fusion_gate_anomaly_mean
+                        -
+                        fusion_gate_normal_mean
+                    )
+            }
+
+            # =================================================
+            # 15.9 Shift diagnostics
+            # =================================================
+
+            if (
+                len(
+                    diag_shift_score_list
+                )
+                >
+                0
+            ):
+
+                shift_scores = np.concatenate(
+                    diag_shift_score_list,
+                    axis=0
+                )
+
+                shift_result = {
+                    "Shift_Mean":
+                        float(
+                            shift_scores.mean()
+                        ),
+
+                    "Shift_Std":
+                        float(
+                            shift_scores.std()
+                        ),
+                }
+
+                if (
+                    len(
+                        diag_relative_weight_list
+                    )
+                    >
+                    0
+                ):
+
+                    relative_weights = np.concatenate(
+                        diag_relative_weight_list,
+                        axis=0
+                    )
+
+                    shift_result.update(
+                        {
+                            "Alpha_Mean":
+                                float(
+                                    relative_weights.mean()
+                                ),
+
+                            "Alpha_Std":
+                                float(
+                                    relative_weights.std()
+                                ),
+
+                            "Alpha_Min":
+                                float(
+                                    relative_weights.min()
+                                ),
+
+                            "Alpha_Max":
+                                float(
+                                    relative_weights.max()
+                                )
+                        }
+                    )
+
+                res[
+                    "World_Shift"
+                ] = shift_result
+
+            # =================================================
+            # 15.10 Mean normal / anomaly separation
+            # =================================================
+
+            if diag_normal_patch_count > 0:
+
+                pred_normal_mean = (
+                    diag_pred_normal_sum
+                    /
+                    diag_normal_patch_count
+                )
+
+                geo_normal_mean = (
+                    diag_geo_normal_sum
+                    /
+                    diag_normal_patch_count
+                )
+
+                evidence_normal_mean = (
+                    diag_evidence_normal_sum
+                    /
+                    diag_normal_patch_count
+                )
+
+            else:
+
+                pred_normal_mean = float(
+                    "nan"
+                )
+
+                geo_normal_mean = float(
+                    "nan"
+                )
+
+                evidence_normal_mean = float(
+                    "nan"
+                )
+
+            if diag_anomaly_patch_count > 0:
+
+                pred_anomaly_mean = (
+                    diag_pred_anomaly_sum
+                    /
+                    diag_anomaly_patch_count
+                )
+
+                geo_anomaly_mean = (
+                    diag_geo_anomaly_sum
+                    /
+                    diag_anomaly_patch_count
+                )
+
+                evidence_anomaly_mean = (
+                    diag_evidence_anomaly_sum
+                    /
+                    diag_anomaly_patch_count
+                )
+
+            else:
+
+                pred_anomaly_mean = float(
+                    "nan"
+                )
+
+                geo_anomaly_mean = float(
+                    "nan"
+                )
+
+                evidence_anomaly_mean = float(
+                    "nan"
+                )
+
+            res[
+                "World_Mean"
+            ] = {
+                "Pred_N":
+                    pred_normal_mean,
+
+                "Pred_A":
+                    pred_anomaly_mean,
+
+                "Geo_N":
+                    geo_normal_mean,
+
+                "Geo_A":
+                    geo_anomaly_mean,
+
+                "Evi_N":
+                    evidence_normal_mean,
+
+                "Evi_A":
+                    evidence_anomaly_mean
+            }
+
+    return res
+
+def eval_all_class(clip_model: CLIP, dataset_name, test_dataset, args, logger, device):
+    total_res = []
+    if args.fewshot > 0:
+        fewshot_dataset = copy.deepcopy(test_dataset)
+        fewshot_dataset.train = True
+        fewshot_dataset.fewshot = args.fewshot
+
+    for category in test_dataset.categories:
+        print(category)
+        test_dataset.update(category)
+
+        ## store memory
+        if args.fewshot > 0:
+            print("use few shot")
+            fewshot_dataset.update(category)
+            logger.info("{}, {}".format(fewshot_dataset.category, fewshot_dataset.cur_img_paths))
+            few_shot_dataloader = torch.utils.data.DataLoader(fewshot_dataset,
+                                                              batch_size=max(args.fewshot, args.batch_size),
+                                                              shuffle=False)
+            with torch.no_grad():
+                for items in tqdm(few_shot_dataloader):
+                    imgs = items[0].to(device)
+                    # imgs = torch.cat([imgs] + [transforms.functional.rotate(imgs, 90) for degrees in [90, 180, 270]])
+                    clip_model.store_memory(imgs, args)
+
+        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+        if args.vis != 0:
+            print("visualize")
+            # visualize_attention_map(clip_model, test_dataset, args, test_dataset.transform, device)
+            visualize(clip_model, test_dataset, args, test_dataset.transform, device)
+        else:
+            category_res = evaluation_pixel(clip_model, dataset_name, test_dataloader, args, device)
+            total_res.append(category_res)
+            res_str = get_res_str(category_res)
+            logger.info("Category {}: {}".format(category, res_str))
+    if args.vis == 0:
+        average_res = cal_average_res(total_res)
+        average_res_str = get_res_str(average_res)
+        logger.info("Average: {}".format(average_res_str))
