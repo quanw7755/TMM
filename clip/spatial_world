@@ -1,0 +1,2333 @@
+"""
+  @Author: 王权
+  @FileName: spatial_world.py
+  @DateTime: 2026/9/5 22:43
+  @SoftWare: PyCharm
+"""
+import math
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+# ============================================================
+# 1. Center-free spatial context kernel
+# ============================================================
+
+def build_neighbor_kernel(kernel_size, sigma=None):
+    """
+    Build a Gaussian-like spatial context kernel.
+
+    IMPORTANT:
+    The center position is explicitly removed.
+
+    Therefore the predictor cannot directly observe
+    the target patch that it is required to predict.
+    """
+
+    if sigma is None:
+        sigma = kernel_size / 2.0
+
+    coord = torch.arange(
+        kernel_size,
+        dtype=torch.float32
+    )
+
+    coord = coord - (kernel_size - 1) / 2.0
+
+    yy, xx = torch.meshgrid(
+        coord,
+        coord,
+        indexing="ij"
+    )
+
+    kernel = torch.exp(
+        -(xx ** 2 + yy ** 2)
+        / (2.0 * sigma ** 2)
+    )
+
+    # --------------------------------------------------------
+    # Remove center patch
+    # --------------------------------------------------------
+    center = kernel_size // 2
+    kernel[center, center] = 0.0
+
+    # --------------------------------------------------------
+    # Normalize remaining context
+    # --------------------------------------------------------
+    kernel = kernel / kernel.sum().clamp_min(1e-6)
+
+    return kernel
+
+
+# ============================================================
+# 2. Spatial World Predictor
+# ============================================================
+# ============================================================
+# 2. Domain-Robust Spatial World Predictor
+# ============================================================
+
+class SpatialWorldPredictor(nn.Module):
+    """
+    Spatial-DR v1.
+
+    Domain-robust spatial latent prediction from center-free
+    CLIP Conv1 context.
+
+    Main changes over legacy Spatial World:
+        1. parameter-free token normalization;
+        2. no absolute position encoding;
+        3. adaptive 3x3 / 5x5 local context weighting;
+        4. conservatively gated global context;
+        5. depthwise-convolution neighborhood aggregation.
+    """
+
+    def __init__(
+        self,
+        dim=1024,
+        hidden_dim=512
+    ):
+        super().__init__()
+
+        # ----------------------------------------------------
+        # Explicit implementation tag.
+        #
+        # main.py will verify this before training so that an
+        # old predictor cannot be accidentally used.
+        # ----------------------------------------------------
+
+        self.variant = "spatial_dr_v1"
+
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+
+        # ====================================================
+        # 1. Parameter-free normalization
+        #
+        # Suppress domain-dependent feature magnitude/style
+        # while avoiding learnable source-specific affine
+        # parameters.
+        # ====================================================
+
+        self.input_norm = nn.LayerNorm(
+            dim,
+            elementwise_affine=False
+        )
+
+        # ====================================================
+        # 2. Local context projections
+        # ====================================================
+
+        self.local3_proj = nn.Linear(
+            dim,
+            hidden_dim
+        )
+
+        self.local5_proj = nn.Linear(
+            dim,
+            hidden_dim
+        )
+
+        # ====================================================
+        # 3. Global context projection
+        # ====================================================
+
+        self.global_proj = nn.Linear(
+            dim,
+            hidden_dim
+        )
+
+        # ====================================================
+        # 4. Adaptive local-scale weighting
+        #
+        # Initial:
+        #
+        # softmax([0,0]) = [0.5,0.5]
+        # ====================================================
+
+        self.local_scale_logits = nn.Parameter(
+            torch.zeros(
+                2,
+                dtype=torch.float32
+            )
+        )
+
+        # ====================================================
+        # 5. Conservative global-context gate
+        #
+        # sigmoid(-2) ~= 0.1192
+        # ====================================================
+
+        self.global_gate_logit = nn.Parameter(
+            torch.tensor(
+                -2.0,
+                dtype=torch.float32
+            )
+        )
+
+        # ====================================================
+        # 6. Hidden latent refinement
+        # ====================================================
+
+        self.hidden_norm = nn.LayerNorm(
+            hidden_dim
+        )
+
+        self.mlp = nn.Sequential(
+            nn.Linear(
+                hidden_dim,
+                hidden_dim * 2
+            ),
+
+            nn.GELU(),
+
+            nn.Linear(
+                hidden_dim * 2,
+                hidden_dim
+            )
+        )
+
+        # ====================================================
+        # 7. Predict actual CLIP Layer-L representation
+        # ====================================================
+
+        self.out_proj = nn.Linear(
+            hidden_dim,
+            dim
+        )
+
+        # ====================================================
+        # 8. Center-excluded Gaussian spatial kernels
+        # ====================================================
+
+        self.register_buffer(
+            "kernel3",
+            build_neighbor_kernel(
+                kernel_size=3,
+                sigma=1.5
+            )
+        )
+
+        self.register_buffer(
+            "kernel5",
+            build_neighbor_kernel(
+                kernel_size=5,
+                sigma=2.5
+            )
+        )
+
+    # ========================================================
+    # Diagnostic helper
+    # ========================================================
+
+    def get_context_weights(
+        self
+    ):
+        """
+        Returns:
+            local_weights:
+                [2] -> w3, w5
+
+            global_gate:
+                scalar -> sigmoid(global_gate_logit)
+        """
+
+        local_weights = torch.softmax(
+            self.local_scale_logits,
+            dim=0
+        )
+
+        global_gate = torch.sigmoid(
+            self.global_gate_logit
+        )
+
+        return (
+            local_weights,
+            global_gate
+        )
+
+    # ========================================================
+    # Center-free local aggregation
+    # ========================================================
+
+    def _neighbor_context(
+        self,
+        tokens,
+        kernel
+    ):
+        """
+        tokens:
+            [B,N,D]
+
+        kernel:
+            [K,K], center == 0
+
+        return:
+            [B,N,D]
+
+        Mathematically equivalent to center-excluded weighted
+        neighborhood aggregation, implemented using depthwise
+        convolution instead of F.unfold.
+        """
+
+        B, N, D = tokens.shape
+
+        h = int(
+            math.sqrt(N)
+        )
+
+        if h * h != N:
+
+            raise ValueError(
+                f"Spatial-DR expects a square patch grid, "
+                f"but received N={N}."
+            )
+
+        # ====================================================
+        # [B,N,D] -> [B,D,H,W]
+        # ====================================================
+
+        feature_map = (
+            tokens
+            .transpose(
+                1,
+                2
+            )
+            .reshape(
+                B,
+                D,
+                h,
+                h
+            )
+        )
+
+        k = kernel.shape[0]
+
+        padding = (
+            k // 2
+        )
+
+        kernel = kernel.to(
+            device=tokens.device,
+            dtype=tokens.dtype
+        )
+
+        # ====================================================
+        # Same spatial kernel independently applied to each
+        # feature channel.
+        # ====================================================
+
+        depthwise_kernel = (
+            kernel
+            .view(
+                1,
+                1,
+                k,
+                k
+            )
+            .expand(
+                D,
+                1,
+                k,
+                k
+            )
+            .contiguous()
+        )
+
+        numerator = F.conv2d(
+            feature_map,
+            depthwise_kernel,
+            stride=1,
+            padding=padding,
+            groups=D
+        )
+
+        # ====================================================
+        # Boundary-aware normalization
+        #
+        # Interior:
+        #     denominator = 1
+        #
+        # Borders:
+        #     denominator < 1
+        #
+        # This prevents zero-padding from reducing the
+        # magnitude of border context.
+        # ====================================================
+
+        valid_map = torch.ones(
+            B,
+            1,
+            h,
+            h,
+            device=tokens.device,
+            dtype=tokens.dtype
+        )
+
+        denominator = F.conv2d(
+            valid_map,
+            kernel.view(
+                1,
+                1,
+                k,
+                k
+            ),
+            stride=1,
+            padding=padding
+        )
+
+        context = (
+            numerator
+            /
+            denominator.clamp_min(
+                1e-6
+            )
+        )
+
+        # ====================================================
+        # [B,D,H,W] -> [B,N,D]
+        # ====================================================
+
+        context = (
+            context
+            .flatten(
+                2
+            )
+            .transpose(
+                1,
+                2
+            )
+        )
+
+        return context
+
+    # ========================================================
+    # Forward
+    # ========================================================
+
+    def forward(
+        self,
+        stem_tokens
+    ):
+        """
+        Parameters
+        ----------
+        stem_tokens:
+            frozen CLIP Conv1 patch embeddings
+            [B,N,D]
+
+        Returns
+        -------
+        predicted:
+            context-conditioned expected CLIP latent
+            [B,N,D]
+        """
+
+        if stem_tokens.ndim != 3:
+
+            raise ValueError(
+                "Spatial-DR expects stem_tokens [B,N,D], "
+                f"but got {tuple(stem_tokens.shape)}."
+            )
+
+        B, N, D = stem_tokens.shape
+
+        if D != self.dim:
+
+            raise ValueError(
+                f"Spatial-DR expected D={self.dim}, "
+                f"but received D={D}."
+            )
+
+        h = int(
+            math.sqrt(N)
+        )
+
+        if h * h != N:
+
+            raise ValueError(
+                f"Spatial-DR patch number N={N} "
+                "is not a square grid."
+            )
+
+        # ====================================================
+        # 1. Domain-robust token normalization
+        # ====================================================
+
+        tokens = self.input_norm(
+            stem_tokens.float()
+        )
+
+        # ====================================================
+        # 2. Center-excluded local contexts
+        # ====================================================
+
+        context3 = self._neighbor_context(
+            tokens,
+            self.kernel3
+        )
+
+        context5 = self._neighbor_context(
+            tokens,
+            self.kernel5
+        )
+
+        # ====================================================
+        # 3. Global context excluding current patch
+        #
+        # g_i =
+        #     (sum_j z_j - z_i) / (N - 1)
+        # ====================================================
+
+        global_sum = tokens.sum(
+            dim=1,
+            keepdim=True
+        )
+
+        global_context = (
+            global_sum
+            -
+            tokens
+        ) / max(
+            N - 1,
+            1
+        )
+
+        # ====================================================
+        # 4. Learn relative local-scale preference
+        # ====================================================
+
+        local_weights = torch.softmax(
+            self.local_scale_logits,
+            dim=0
+        )
+
+        local3_feature = self.local3_proj(
+            context3
+        )
+
+        local5_feature = self.local5_proj(
+            context5
+        )
+
+        local_feature = (
+            local_weights[0]
+            *
+            local3_feature
+            +
+            local_weights[1]
+            *
+            local5_feature
+        )
+
+        # ====================================================
+        # 5. Suppress source-specific global shortcuts
+        # ====================================================
+
+        global_gate = torch.sigmoid(
+            self.global_gate_logit
+        )
+
+        global_feature = (
+            global_gate
+            *
+            self.global_proj(
+                global_context
+            )
+        )
+
+        # ====================================================
+        # 6. Context-conditioned latent representation
+        # ====================================================
+
+        x = (
+            local_feature
+            +
+            global_feature
+        )
+
+        # ====================================================
+        # 7. Lightweight residual refinement
+        # ====================================================
+
+        x = (
+            x
+            +
+            self.mlp(
+                self.hidden_norm(
+                    x
+                )
+            )
+        )
+
+        # ====================================================
+        # 8. Expected target latent
+        # ====================================================
+
+        predicted = self.out_proj(
+            x
+        )
+
+        return predicted
+
+# ============================================================
+# 3. Predictive Residual Geometry
+# ============================================================
+class WorldResidualGeometry(nn.Module):
+    """
+    World-v2.1 Predictive Residual Geometry.
+
+    Main design:
+
+    1. Learn a source-normal residual PCA subspace.
+    2. Pixel and image world scores are calibrated separately.
+    3. Pixel evidence uses a robust normal envelope:
+
+           T_patch =
+               max(
+                   Q_normal,
+                   median + k * 1.4826 * MAD
+               )
+
+    4. Image evidence keeps quantile calibration only.
+    5. Target-domain data are never used for calibration.
+    """
+
+    def __init__(
+        self,
+        dim=1024,
+        rank=32,
+        common_mode=True
+    ):
+        super().__init__()
+
+        self.dim = dim
+        self.rank = rank
+        self.common_mode = common_mode
+
+        # ====================================================
+        # Normal residual geometry
+        # ====================================================
+
+        self.register_buffer(
+            "center",
+            torch.zeros(dim)
+        )
+
+        self.register_buffer(
+            "basis",
+            torch.zeros(
+                dim,
+                rank
+            )
+        )
+
+        self.register_buffer(
+            "effective_rank",
+            torch.tensor(
+                0,
+                dtype=torch.long
+            )
+        )
+
+        # ====================================================
+        # Patch-level source-normal statistics
+        # ====================================================
+
+        self.register_buffer(
+            "score_median",
+            torch.tensor(0.0)
+        )
+
+        self.register_buffer(
+            "score_mad",
+            torch.tensor(1.0)
+        )
+
+        # Pure quantile threshold
+        self.register_buffer(
+            "patch_quantile_threshold",
+            torch.tensor(0.0)
+        )
+
+        # median + k * robust_sigma
+        self.register_buffer(
+            "patch_robust_threshold",
+            torch.tensor(0.0)
+        )
+
+        # Final:
+        # max(
+        #     quantile threshold,
+        #     robust threshold
+        # )
+        self.register_buffer(
+            "patch_threshold",
+            torch.tensor(0.0)
+        )
+
+        # ====================================================
+        # Image-level source-normal statistics
+        # ====================================================
+
+        self.register_buffer(
+            "image_score_median",
+            torch.tensor(0.0)
+        )
+
+        self.register_buffer(
+            "image_score_mad",
+            torch.tensor(1.0)
+        )
+
+        self.register_buffer(
+            "image_threshold",
+            torch.tensor(0.0)
+        )
+        # ========================================================
+        # Sample-wise residual-shift calibration
+        #
+        # Used by soft_adaptive evidence calibration.
+        #
+        # The statistics are fitted ONLY from source-normal images.
+        # ========================================================
+
+        self.register_buffer(
+            "shift_score_median",
+            torch.tensor(
+                0.0,
+                dtype=torch.float32
+            )
+        )
+
+        self.register_buffer(
+            "shift_score_mad",
+            torch.tensor(
+                1.0,
+                dtype=torch.float32
+            )
+        )
+
+        self.register_buffer(
+            "shift_threshold",
+            torch.tensor(
+                0.0,
+                dtype=torch.float32
+            )
+        )
+
+        self.register_buffer(
+            "shift_ready_flag",
+            torch.tensor(
+                False,
+                dtype=torch.bool
+            )
+        )
+        # ====================================================
+        # State
+        # ====================================================
+
+        self.register_buffer(
+            "ready_flag",
+            torch.tensor(
+                0,
+                dtype=torch.uint8
+            )
+        )
+
+    # ========================================================
+    # Status
+    # ========================================================
+
+    @property
+    def ready(self):
+        return bool(
+            self.ready_flag.item()
+        )
+
+    @property
+    def shift_ready(
+            self
+    ):
+        return bool(
+            self.shift_ready_flag.item()
+        )
+    # ========================================================
+    # Predictive residual
+    # ========================================================
+
+    def residual(
+        self,
+        predicted,
+        target
+    ):
+        """
+        predicted:
+            [B, N, D]
+
+        target:
+            [B, N, D]
+
+        return:
+            normalized target - normalized prediction
+        """
+
+        predicted = F.normalize(
+            predicted.float(),
+            dim=-1
+        )
+
+        target = F.normalize(
+            target.float(),
+            dim=-1
+        )
+
+        residual = (
+            target
+            -
+            predicted
+        )
+
+        return residual
+
+    # ========================================================
+    # Direct predictive discrepancy
+    # ========================================================
+
+    def prediction_score(
+            self,
+            predicted,
+            target
+    ):
+        """
+        Direct contextual prediction discrepancy.
+
+        predicted:
+            [B, N, D]
+
+        target:
+            [B, N, D]
+
+        return:
+            [B, N]
+
+        S_pred = 1 - cos(predicted, target)
+
+        Unlike raw_score(), this score does NOT use:
+            - common-mode cancellation
+            - PCA normal subspace
+            - source-normal threshold calibration
+
+        Therefore it tells us whether contextual prediction
+        itself already contains anomaly-discriminative evidence.
+        """
+
+        predicted_n = F.normalize(
+            predicted.float(),
+            dim=-1,
+            eps=1e-6
+        )
+
+        target_n = F.normalize(
+            target.float(),
+            dim=-1,
+            eps=1e-6
+        )
+
+        similarity = (
+                predicted_n
+                *
+                target_n
+        ).sum(
+            dim=-1
+        )
+
+        score = (
+                1.0
+                -
+                similarity
+        )
+
+        return score
+    # ========================================================
+    # Image-wise common-mode cancellation
+    # ========================================================
+
+    def remove_common_mode(
+        self,
+        residual
+    ):
+        """
+        residual:
+            [B, N, D]
+
+        Remove image-wide shared displacement.
+
+        This suppresses domain-wide common shift and preserves
+        local predictive violations.
+        """
+
+        if not self.common_mode:
+            return residual
+
+        shift = residual.median(
+            dim=1,
+            keepdim=True
+        ).values
+
+        residual = (
+            residual
+            -
+            shift
+        )
+
+        return residual
+
+    # ========================================================
+    # Fit source-normal residual PCA basis
+    # ========================================================
+
+    @torch.no_grad()
+    def fit_basis(
+        self,
+        residual_vectors
+    ):
+        """
+        residual_vectors:
+            [M, D]
+
+        Source NORMAL residuals only.
+
+        Common-mode correction should already have been
+        applied before this function.
+        """
+
+        residual_vectors = (
+            residual_vectors.float()
+        )
+
+        if residual_vectors.ndim != 2:
+            raise ValueError(
+                "residual_vectors must have shape [M,D]."
+            )
+
+        M, D = residual_vectors.shape
+
+        if D != self.dim:
+            raise ValueError(
+                f"Expected residual dimension {self.dim}, "
+                f"but got {D}."
+            )
+
+        if M < 2:
+            raise RuntimeError(
+                "Too few source-normal residual vectors."
+            )
+
+        # ----------------------------------------------------
+        # Center
+        # ----------------------------------------------------
+
+        center = residual_vectors.mean(
+            dim=0
+        )
+
+        x = (
+            residual_vectors
+            -
+            center
+        )
+
+        # ----------------------------------------------------
+        # Low-rank PCA
+        # ----------------------------------------------------
+
+        q = min(
+            self.rank + 8,
+            D,
+            M - 1
+        )
+
+        _, _, V = torch.pca_lowrank(
+            x,
+            q=q,
+            center=False,
+            niter=4
+        )
+
+        effective_rank = min(
+            self.rank,
+            V.shape[1]
+        )
+
+        self.center.copy_(
+            center
+        )
+
+        self.basis.zero_()
+
+        self.basis[
+            :,
+            :effective_rank
+        ].copy_(
+            V[
+                :,
+                :effective_rank
+            ]
+        )
+
+        self.effective_rank.fill_(
+            effective_rank
+        )
+
+    # ========================================================
+    # Raw unexplained predictive residual
+    # ========================================================
+
+    def raw_score(
+        self,
+        predicted,
+        target
+    ):
+        """
+        return:
+            [B, N]
+        """
+
+        if self.effective_rank.item() <= 0:
+            raise RuntimeError(
+                "World residual basis has not been fitted."
+            )
+
+        # ----------------------------------------------------
+        # Predictive residual
+        # ----------------------------------------------------
+
+        residual = self.residual(
+            predicted,
+            target
+        )
+
+        # ----------------------------------------------------
+        # Remove image-wide common displacement
+        # ----------------------------------------------------
+
+        residual = self.remove_common_mode(
+            residual
+        )
+
+        # ----------------------------------------------------
+        # Center according to source-normal residual geometry
+        # ----------------------------------------------------
+
+        x = (
+            residual
+            -
+            self.center.view(
+                1,
+                1,
+                -1
+            )
+        )
+
+        rank = int(
+            self.effective_rank.item()
+        )
+
+        basis = self.basis[
+            :,
+            :rank
+        ]
+
+        # ----------------------------------------------------
+        # Explainable normal residual component
+        # ----------------------------------------------------
+
+        coeff = torch.matmul(
+            x,
+            basis
+        )
+
+        explained = torch.matmul(
+            coeff,
+            basis.t()
+        )
+
+        # ----------------------------------------------------
+        # Unexplainable residual
+        # ----------------------------------------------------
+
+        off = (
+            x
+            -
+            explained
+        )
+
+        # ----------------------------------------------------
+        # Euclidean residual magnitude
+        # ----------------------------------------------------
+
+        score = off.norm(
+            dim=-1
+        )
+
+        return score
+
+    # ========================================================
+    # Patch-level calibration
+    # ========================================================
+
+    @torch.no_grad()
+    def calibrate_patch(
+        self,
+        normal_patch_scores,
+        quantile=0.99,
+        robust_k=2.0
+    ):
+        """
+        Build a robust source-normal patch envelope.
+
+        T_patch =
+            max(
+                Q_quantile,
+                median + robust_k * 1.4826 * MAD
+            )
+
+        No target-domain data are used.
+        """
+
+        scores = (
+            normal_patch_scores
+            .float()
+            .reshape(-1)
+        )
+
+        if scores.numel() == 0:
+            raise RuntimeError(
+                "No normal patch scores for calibration."
+            )
+
+        # ----------------------------------------------------
+        # Robust center
+        # ----------------------------------------------------
+
+        median = scores.median()
+
+        # ----------------------------------------------------
+        # Robust scale
+        # ----------------------------------------------------
+
+        mad = (
+            scores
+            -
+            median
+        ).abs().median()
+
+        mad = mad.clamp_min(
+            1e-6
+        )
+
+        robust_sigma = (
+            1.4826
+            *
+            mad
+        )
+
+        # ----------------------------------------------------
+        # Quantile envelope
+        # ----------------------------------------------------
+
+        quantile_threshold = torch.quantile(
+            scores,
+            quantile
+        )
+
+        # ----------------------------------------------------
+        # Robust-distance envelope
+        # ----------------------------------------------------
+
+        robust_threshold = (
+            median
+            +
+            robust_k
+            *
+            robust_sigma
+        )
+
+        # ----------------------------------------------------
+        # Final conservative source-normal envelope
+        # ----------------------------------------------------
+
+        final_threshold = torch.maximum(
+            quantile_threshold,
+            robust_threshold
+        )
+
+        self.score_median.copy_(
+            median
+        )
+
+        self.score_mad.copy_(
+            mad
+        )
+
+        self.patch_quantile_threshold.copy_(
+            quantile_threshold
+        )
+
+        self.patch_robust_threshold.copy_(
+            robust_threshold
+        )
+
+        self.patch_threshold.copy_(
+            final_threshold
+        )
+
+    # ========================================================
+    # Image-level calibration
+    # ========================================================
+
+    @torch.no_grad()
+    def calibrate_image(
+        self,
+        normal_image_scores,
+        quantile=0.99
+    ):
+        """
+        Image score has its own distribution.
+
+        Keep image calibration based on source-normal
+        image-level Top-K score distribution.
+
+        This part worked well in World-v2 and therefore
+        intentionally remains unchanged.
+        """
+
+        scores = (
+            normal_image_scores
+            .float()
+            .reshape(-1)
+        )
+
+        if scores.numel() == 0:
+            raise RuntimeError(
+                "No normal image scores for calibration."
+            )
+
+        median = scores.median()
+
+        mad = (
+            scores
+            -
+            median
+        ).abs().median()
+
+        mad = mad.clamp_min(
+            1e-6
+        )
+
+        threshold = torch.quantile(
+            scores,
+            quantile
+        )
+
+        self.image_score_median.copy_(
+            median
+        )
+
+        self.image_score_mad.copy_(
+            mad
+        )
+
+        self.image_threshold.copy_(
+            threshold
+        )
+
+        self.ready_flag.fill_(1)
+
+    # ========================================================
+    # Diagnostic z-scores
+    # ========================================================
+    # ========================================================
+    # Source-normal residual-shift calibration
+    # ========================================================
+
+    @torch.no_grad()
+    def calibrate_shift(
+            self,
+            normal_shift_scores,
+            quantile=0.95
+    ):
+        """
+        Calibrate the expected residual-shift range using
+        source-normal images only.
+
+        Parameters
+        ----------
+        normal_shift_scores:
+            [M] or [M,1]
+
+        quantile:
+            source-normal upper quantile used as the nominal
+            shift boundary.
+        """
+
+        scores = (
+            normal_shift_scores
+            .float()
+            .reshape(-1)
+        )
+
+        if scores.numel() == 0:
+            raise RuntimeError(
+                "No source-normal image shift scores "
+                "were provided."
+            )
+
+        # ====================================================
+        # Source-normal shift center
+        # ====================================================
+
+        median = (
+            scores
+            .median()
+        )
+
+        # ====================================================
+        # Source-normal shift scale
+        # ====================================================
+
+        mad = (
+                scores
+                -
+                median
+        ).abs().median()
+
+        mad = mad.clamp_min(
+            1e-6
+        )
+
+        # ====================================================
+        # Source-normal nominal upper boundary
+        # ====================================================
+
+        threshold = torch.quantile(
+            scores,
+            float(
+                quantile
+            )
+        )
+
+        self.shift_score_median.copy_(
+            median
+        )
+
+        self.shift_score_mad.copy_(
+            mad
+        )
+
+        self.shift_threshold.copy_(
+            threshold
+        )
+
+        self.shift_ready_flag.fill_(
+            True
+        )
+
+    # ========================================================
+    # Adaptive relative weight
+    # ========================================================
+
+    def adaptive_relative_weight(
+            self,
+            shift_score,
+            temperature=1.0
+    ):
+        """
+        Convert residual shift into an adaptive relative weight.
+
+            alpha_x =
+                sigmoid(
+                    (D_x - T_D)
+                    /
+                    (temperature * sigma_D)
+                )
+
+        where T_D and sigma_D are estimated from source-normal
+        images.
+
+        Small residual shift:
+            alpha_x -> small
+            trust source coordinate more.
+
+        Large residual shift:
+            alpha_x -> large
+            trust image-relative coordinate more.
+        """
+
+        if not self.shift_ready:
+            raise RuntimeError(
+                "Adaptive residual-shift calibration "
+                "has not been fitted."
+            )
+
+        temperature = max(
+            float(
+                temperature
+            ),
+            1e-3
+        )
+
+        shift_scale = (
+                1.4826
+                *
+                self.shift_score_mad
+        ).clamp_min(
+            1e-6
+        )
+
+        adaptive_weight = torch.sigmoid(
+            (
+                    shift_score
+                    -
+                    self.shift_threshold
+            )
+            /
+            (
+                    temperature
+                    *
+                    shift_scale
+                    +
+                    1e-6
+            )
+        )
+
+        return adaptive_weight
+    # ========================================================
+    # Diagnostic / calibration coordinates
+    # ========================================================
+
+    def patch_zscore(
+            self,
+            raw_score
+    ):
+        """
+        Source-normal robust standardized residual.
+
+        z_src =
+            (S - median_src)
+            /
+            (1.4826 * MAD_src)
+        """
+
+        scale = (
+                1.4826
+                *
+                self.score_mad
+                +
+                1e-6
+        )
+
+        return (
+                raw_score.float()
+                -
+                self.score_median
+        ) / scale
+
+    def source_quantile_z(
+            self
+    ):
+        """
+        Express the source-normal quantile threshold in
+        source robust-z coordinates.
+        """
+
+        scale = (
+                1.4826
+                *
+                self.score_mad
+                +
+                1e-6
+        )
+
+        return (
+                self.patch_quantile_threshold
+                -
+                self.score_median
+        ) / scale
+
+    # ========================================================
+    # Image-relative robust residual coordinates
+    # ========================================================
+
+    # ========================================================
+    # Source residual scale
+    # ========================================================
+
+    def source_residual_scale(
+            self
+    ):
+        """
+        Robust residual scale estimated from source-normal
+        patch scores.
+        """
+
+        return (
+                1.4826
+                *
+                self.score_mad
+        ).clamp_min(
+            1e-6
+        )
+
+    # ========================================================
+    # Image-wise residual statistics
+    # ========================================================
+
+    def image_residual_stats(
+            self,
+            raw_score,
+            scale_floor=0.25
+    ):
+        """
+        Compute robust residual statistics for each test image.
+
+        Parameters
+        ----------
+        raw_score:
+            [B,N]
+
+        scale_floor:
+            lower bound of image residual scale expressed as
+            a fraction of the source-normal robust scale.
+
+        Returns
+        -------
+        image_median:
+            [B,1]
+
+        image_scale:
+            [B,1]
+        """
+
+        raw_score = raw_score.float()
+
+        if raw_score.ndim != 2:
+            raise ValueError(
+                "raw_score must have shape [B,N], "
+                f"but got {tuple(raw_score.shape)}."
+            )
+
+        # ====================================================
+        # Image-wise median
+        # ====================================================
+
+        image_median = (
+            raw_score
+            .median(
+                dim=1,
+                keepdim=True
+            )
+            .values
+        )
+
+        # ====================================================
+        # Image-wise MAD
+        # ====================================================
+
+        image_mad = (
+            (
+                    raw_score
+                    -
+                    image_median
+            )
+            .abs()
+            .median(
+                dim=1,
+                keepdim=True
+            )
+            .values
+        )
+
+        image_scale = (
+                1.4826
+                *
+                image_mad
+        )
+
+        # ====================================================
+        # Prevent unstable relative normalization
+        # ====================================================
+
+        source_scale = (
+            self.source_residual_scale()
+        )
+
+        min_scale = (
+                float(
+                    scale_floor
+                )
+                *
+                source_scale
+        )
+
+        image_scale = torch.maximum(
+            image_scale,
+            min_scale
+        )
+
+        image_scale = (
+                image_scale
+                +
+                1e-6
+        )
+
+        return (
+            image_median,
+            image_scale
+        )
+
+    # ========================================================
+    # Image-relative residual coordinate
+    # ========================================================
+
+    def image_relative_zscore(
+            self,
+            raw_score,
+            scale_floor=0.25
+    ):
+        """
+        Image-relative robust residual coordinate.
+
+            z_rel =
+                (S_i - median_x)
+                /
+                scale_x
+
+        No target labels are used.
+        """
+
+        (
+            image_median,
+            image_scale
+        ) = self.image_residual_stats(
+            raw_score,
+            scale_floor=
+            scale_floor
+        )
+
+        relative_z = (
+                             raw_score.float()
+                             -
+                             image_median
+                     ) / image_scale
+
+        return (
+            relative_z,
+            image_median,
+            image_scale
+        )
+
+    # ========================================================
+    # Sample-wise residual shift
+    # ========================================================
+
+    def image_shift_score(
+            self,
+            raw_score,
+            scale_floor=0.25
+    ):
+        """
+        Measure how much the residual distribution of a
+        current image deviates from the source-normal
+        residual distribution.
+
+        D_x =
+            |m_x - m_s| / s_s
+            +
+            |log(s_x / s_s)|
+
+        where
+
+            m_s : source-normal residual median
+            s_s : source-normal robust residual scale
+            m_x : current-image residual median
+            s_x : current-image robust residual scale
+
+        Returns
+        -------
+        shift_score:
+            [B,1]
+        """
+
+        (
+            image_median,
+            image_scale
+        ) = self.image_residual_stats(
+            raw_score,
+            scale_floor=
+            scale_floor
+        )
+
+        source_median = (
+            self.score_median
+        )
+
+        source_scale = (
+            self.source_residual_scale()
+        )
+
+        # ====================================================
+        # Residual-center shift
+        # ====================================================
+
+        center_shift = (
+                               image_median
+                               -
+                               source_median
+                       ).abs() / (
+                               source_scale
+                               +
+                               1e-6
+                       )
+
+        # ====================================================
+        # Residual-scale shift
+        # ====================================================
+
+        scale_shift = torch.abs(
+            torch.log(
+                (
+                        image_scale
+                        +
+                        1e-6
+                )
+                /
+                (
+                        source_scale
+                        +
+                        1e-6
+                )
+            )
+        )
+
+        shift_score = (
+                center_shift
+                +
+                scale_shift
+        )
+
+        return shift_score
+    # ========================================================
+    # Patch evidence builder
+    # ========================================================
+
+    def build_patch_evidence(
+            self,
+            raw_score,
+            mode="hard_max",
+            relative_weight=0.5,
+            relative_tau=1.0,
+            soft_temperature=0.5,
+            relative_scale_floor=0.25,
+            reliability_tau=0.5,
+            reliability_temperature=0.5,
+            shift_temperature=1.0
+    ):
+        """
+        Build pixel-level Spatial-DR evidence.
+
+        Supported modes
+        ---------------
+        hard_max:
+            Legacy conservative threshold.
+
+        hard_quantile:
+            Source-normal Q threshold.
+
+        hard_robust:
+            Robust source threshold.
+
+        soft_source:
+            Continuous source-normal calibration.
+
+        soft_relative:
+            Fixed source-relative combination.
+
+        soft_adaptive:
+            Shift-adaptive source-relative calibration.
+
+        Returns
+        -------
+        dict containing:
+
+            evidence
+            reliability
+            activation_margin
+            source_z
+            relative_z
+            combined_z
+            shift_score
+            relative_weight
+        """
+
+        raw_score = raw_score.float()
+
+        if raw_score.ndim != 2:
+            raise ValueError(
+                "raw_score must have shape [B,N], "
+                f"but got {tuple(raw_score.shape)}."
+            )
+
+        B = raw_score.size(0)
+
+        # ========================================================
+        # 1. Source-normal robust coordinate
+        # ========================================================
+
+        source_z = self.patch_zscore(
+            raw_score
+        )
+
+        # ========================================================
+        # 2. Image-relative coordinate
+        # ========================================================
+
+        (
+            relative_z,
+            _,
+            _
+        ) = self.image_relative_zscore(
+            raw_score,
+            scale_floor=
+            relative_scale_floor
+        )
+
+        # ========================================================
+        # 3. Current-image residual shift
+        # ========================================================
+
+        shift_score = self.image_shift_score(
+            raw_score,
+            scale_floor=
+            relative_scale_floor
+        )
+
+        source_scale = (
+                self.source_residual_scale()
+                +
+                1e-6
+        )
+
+        # ========================================================
+        # HARD MODES
+        # ========================================================
+
+        if mode in {
+            "hard_max",
+            "hard_quantile",
+            "hard_robust"
+        }:
+
+            if mode == "hard_max":
+
+                threshold = (
+                    self.patch_threshold
+                )
+
+            elif mode == "hard_quantile":
+
+                threshold = (
+                    self.patch_quantile_threshold
+                )
+
+            else:
+
+                threshold = (
+                    self.patch_robust_threshold
+                )
+
+            activation_margin = (
+                                        raw_score
+                                        -
+                                        threshold
+                                ) / source_scale
+
+            evidence = F.relu(
+                activation_margin
+            )
+
+            reliability = torch.ones_like(
+                evidence
+            )
+
+            relative_weight_tensor = torch.zeros(
+                B,
+                1,
+                device=raw_score.device,
+                dtype=raw_score.dtype
+            )
+
+            return {
+                "evidence":
+                    evidence,
+
+                "reliability":
+                    reliability,
+
+                "activation_margin":
+                    activation_margin,
+
+                "source_z":
+                    source_z,
+
+                "relative_z":
+                    relative_z,
+
+                "combined_z":
+                    source_z,
+
+                "shift_score":
+                    shift_score,
+
+                "relative_weight":
+                    relative_weight_tensor
+            }
+
+        # ========================================================
+        # Source quantile in robust-z coordinates
+        # ========================================================
+
+        source_tau = (
+            self.source_quantile_z()
+        )
+
+        soft_temperature = max(
+            float(
+                soft_temperature
+            ),
+            1e-3
+        )
+
+        # ========================================================
+        # SOFT SOURCE
+        # ========================================================
+
+        if mode == "soft_source":
+            combined_z = (
+                source_z
+            )
+
+            activation_margin = (
+                    combined_z
+                    -
+                    source_tau
+            )
+
+            evidence = (
+                    soft_temperature
+                    *
+                    F.softplus(
+                        activation_margin
+                        /
+                        soft_temperature
+                    )
+            )
+
+            reliability = torch.ones_like(
+                evidence
+            )
+
+            relative_weight_tensor = torch.zeros(
+                B,
+                1,
+                device=raw_score.device,
+                dtype=raw_score.dtype
+            )
+
+            return {
+                "evidence":
+                    evidence,
+
+                "reliability":
+                    reliability,
+
+                "activation_margin":
+                    activation_margin,
+
+                "source_z":
+                    source_z,
+
+                "relative_z":
+                    relative_z,
+
+                "combined_z":
+                    combined_z,
+
+                "shift_score":
+                    shift_score,
+
+                "relative_weight":
+                    relative_weight_tensor
+            }
+
+        # ========================================================
+        # FIXED SOFT RELATIVE
+        # ========================================================
+
+        if mode == "soft_relative":
+
+            alpha = min(
+                max(
+                    float(
+                        relative_weight
+                    ),
+                    0.0
+                ),
+                1.0
+            )
+
+            relative_weight_tensor = torch.full(
+                (
+                    B,
+                    1
+                ),
+                alpha,
+                device=raw_score.device,
+                dtype=raw_score.dtype
+            )
+
+        # ========================================================
+        # SHIFT-ADAPTIVE SOFT RELATIVE
+        # ========================================================
+
+        elif mode == "soft_adaptive":
+
+            relative_weight_tensor = (
+                self.adaptive_relative_weight(
+                    shift_score=
+                    shift_score,
+                    temperature=
+                    shift_temperature
+                )
+            )
+
+        else:
+
+            raise ValueError(
+                "Unsupported world pixel evidence mode: "
+                f"{mode}. "
+                "Expected one of "
+                "['hard_max', "
+                "'hard_quantile', "
+                "'hard_robust', "
+                "'soft_source', "
+                "'soft_relative', "
+                "'soft_adaptive']."
+            )
+
+        # ========================================================
+        # 4. Combined robust coordinate
+        #
+        # alpha is [B,1] and broadcasts across N patches.
+        # ========================================================
+
+        alpha = (
+            relative_weight_tensor
+        )
+
+        combined_z = (
+                (
+                        1.0
+                        -
+                        alpha
+                )
+                *
+                source_z
+                +
+                alpha
+                *
+                relative_z
+        )
+
+        # ========================================================
+        # 5. Combined reference level
+        # ========================================================
+
+        combined_tau = (
+                (
+                        1.0
+                        -
+                        alpha
+                )
+                *
+                source_tau
+                +
+                alpha
+                *
+                float(
+                    relative_tau
+                )
+        )
+
+        activation_margin = (
+                combined_z
+                -
+                combined_tau
+        )
+
+        # ========================================================
+        # 6. Continuous evidence
+        # ========================================================
+
+        evidence = (
+                soft_temperature
+                *
+                F.softplus(
+                    activation_margin
+                    /
+                    soft_temperature
+                )
+        )
+
+        # ========================================================
+        # 7. Cross-coordinate reliability
+        # ========================================================
+
+        reliability_temperature = max(
+            float(
+                reliability_temperature
+            ),
+            1e-3
+        )
+
+        source_support = torch.sigmoid(
+            (
+                    source_z
+                    -
+                    float(
+                        reliability_tau
+                    )
+            )
+            /
+            reliability_temperature
+        )
+
+        relative_support = torch.sigmoid(
+            (
+                    relative_z
+                    -
+                    float(
+                        reliability_tau
+                    )
+            )
+            /
+            reliability_temperature
+        )
+
+        reliability = torch.sqrt(
+            (
+                    source_support
+                    *
+                    relative_support
+            ).clamp_min(
+                1e-8
+            )
+        )
+
+        return {
+            "evidence":
+                evidence,
+
+            "reliability":
+                reliability,
+
+            "activation_margin":
+                activation_margin,
+
+            "source_z":
+                source_z,
+
+            "relative_z":
+                relative_z,
+
+            "combined_z":
+                combined_z,
+
+            "shift_score":
+                shift_score,
+
+            "relative_weight":
+                relative_weight_tensor
+        }
+    # ========================================================
+    # Backward-compatible hard evidence
+    # ========================================================
+
+    def patch_evidence(
+            self,
+            raw_score
+    ):
+        """
+        Preserve the previous interface.
+
+        Calling patch_evidence(raw_score) directly reproduces
+        legacy hard-max calibration.
+        """
+
+        output = self.build_patch_evidence(
+            raw_score,
+            mode="hard_max"
+        )
+
+        return output[
+            "evidence"
+        ]
+
+    # ========================================================
+    # Image anomaly evidence
+    # ========================================================
+
+    def image_evidence(
+            self,
+            image_score
+    ):
+        """
+        Keep the existing image-level calibration unchanged.
+        """
+
+        robust_scale = (
+                1.4826
+                *
+                self.image_score_mad
+                +
+                1e-6
+        )
+
+        evidence = F.relu(
+            (
+                    image_score
+                    -
+                    self.image_threshold
+            )
+            /
+            robust_scale
+        )
+
+        return evidence
+
+    # ========================================================
+    # Direct contextual prediction discrepancy
+    # ========================================================
+
+    def prediction_score(
+            self,
+            predicted,
+            target
+    ):
+        """
+        S_pred = 1 - cosine(predicted, target)
+        """
+
+        predicted_n = F.normalize(
+            predicted.float(),
+            dim=-1,
+            eps=1e-6
+        )
+
+        target_n = F.normalize(
+            target.float(),
+            dim=-1,
+            eps=1e-6
+        )
+
+        score = (
+                1.0
+                -
+                (
+                        predicted_n
+                        *
+                        target_n
+                )
+                .sum(
+                    dim=-1
+                )
+        )
+
+        return score
+
+    # ========================================================
+    # Legacy forward
+    # ========================================================
+
+    def forward(
+            self,
+            predicted,
+            target
+    ):
+        """
+        Keep legacy forward behavior for backward compatibility.
+
+        New inference should use:
+            raw_score()
+            +
+            build_patch_evidence()
+        through CLIP.detect_world().
+        """
+
+        if not self.ready:
+            raise RuntimeError(
+                "WorldResidualGeometry is not calibrated."
+            )
+
+        raw = self.raw_score(
+            predicted,
+            target
+        )
+
+        z = self.patch_zscore(
+            raw
+        )
+
+        evidence = self.patch_evidence(
+            raw
+        )
+
+        return (
+            raw,
+            z,
+            evidence
+        )
+    # ========================================================
+    # Forward
+    # ========================================================
+
+    def forward(
+        self,
+        predicted,
+        target
+    ):
+        if not self.ready:
+            raise RuntimeError(
+                "WorldResidualGeometry is not calibrated."
+            )
+
+        raw = self.raw_score(
+            predicted,
+            target
+        )
+
+        z = self.patch_zscore(
+            raw
+        )
+
+        evidence = self.patch_evidence(
+            raw
+        )
+
+        return (
+            raw,
+            z,
+            evidence
+        )
